@@ -4,36 +4,53 @@ const https = require('https');
 const { WebSocketServer } = require('ws');
 const net = require('net');
 const tls = require('tls');
+const dns = require('dns');
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 
 const API_KEY = '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';
 
-// DNS у Render иногда глючит — резолвим через Cloudflare (1.1.1.1)
-function resolveDoH(hostname) {
+function dohQuery(serverIP, serverName, hostname, type) {
     return new Promise((resolve, reject) => {
         const req = https.get({
-            host: '1.1.1.1',
-            servername: 'cloudflare-dns.com',
-            path: '/dns-query?name=' + hostname + '&type=A',
-            headers: { accept: 'application/dns-json', host: 'cloudflare-dns.com' },
+            host: serverIP,
+            servername: serverName,
+            path: '/dns-query?name=' + hostname + '&type=' + type,
+            headers: { accept: 'application/dns-json', host: serverName },
             timeout: 8000
         }, (r) => {
             let d = '';
             r.on('data', c => d += c);
             r.on('end', () => {
-                try {
-                    const j = JSON.parse(d);
-                    const ans = (j.Answer || []).filter(a => a.type === 1);
-                    if (ans.length) return resolve(ans[0].data);
-                    reject(new Error('пустой ответ'));
-                } catch (e) { reject(e); }
+                try { resolve(JSON.parse(d)); } catch (e) { reject(e); }
             });
         });
         req.on('error', reject);
-        req.on('timeout', () => { req.destroy(); reject(new Error('таймаут')); });
+        req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
     });
+}
+
+async function resolveHost(hostname, depth) {
+    depth = depth || 0;
+    if (depth > 3) throw new Error('CNAME слишком глубокий');
+    const servers = [
+        { ip: '1.1.1.1', name: 'cloudflare-dns.com' },
+        { ip: '8.8.8.8', name: 'dns.google' },
+        { ip: '9.9.9.9', name: 'dns.quad9.net' }
+    ];
+    for (const s of servers) {
+        try {
+            const j = await dohQuery(s.ip, s.name, hostname, 'A');
+            const ans = j.Answer || [];
+            const a = ans.find(x => x.type === 1);
+            if (a) return a.data;
+            const cn = ans.find(x => x.type === 5);
+            if (cn) return await resolveHost(cn.data.replace(/\.$/, ''), depth + 1);
+        } catch (e) { /* следующий сервер */ }
+    }
+    const r = await dns.promises.lookup(hostname);
+    return r.address;
 }
 
 let ipCache = { ip: null, ts: 0 };
@@ -47,7 +64,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
     const body = JSON.stringify(req.body);
     try {
         if (!ipCache.ip || Date.now() - ipCache.ts > 300000) {
-            ipCache.ip = await resolveDoH('api.openrouter.ai');
+            ipCache.ip = await resolveHost('api.openrouter.ai');
             ipCache.ts = Date.now();
             console.log('IP api.openrouter.ai =', ipCache.ip);
         }
@@ -114,4 +131,4 @@ wss.on('connection', (ws) => {
     ws.on('close', () => { if (upstream) upstream.destroy(); });
 });
 
-server.listen(3000, () => console.log('Relay ready (HTTP-proxy + DoH mode)'));
+server.listen(3000, () => console.log('Relay ready (HTTP-proxy + multi-DoH mode)'));
