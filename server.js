@@ -8,8 +8,9 @@ const dns = require('dns');
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 
-const API_KEY = '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';
-const TARGET = 'openrouter.ai'; // <-- ВОТ ФИКС: API живёт здесь, а не на api.openrouter.ai
+// Ключ берётся из Environment Variables на Render (туда ты его уже вставил)
+const API_KEY = process.env.OPENROUTER_API_KEY;
+const TARGET = 'openrouter.ai';
 
 app.get('/', (req, res) => res.send('Relay OK'));
 app.get('/api/v1/models', (req, res) => {
@@ -18,6 +19,7 @@ app.get('/api/v1/models', (req, res) => {
 
 app.post('/api/v1/chat/completions', (req, res) => {
     const body = JSON.stringify(req.body);
+    if (!API_KEY) return res.status(500).send('no API key in env');
     dns.promises.lookup(TARGET).then(({ address }) => {
         const sock = net.connect(443, address, () => {
             const t = tls.connect({ socket: sock, servername: TARGET }, () => {
@@ -83,4 +85,4 @@ wss.on('connection', (ws) => {
     ws.on('close', () => { if (upstream) upstream.destroy(); });
 });
 
-server.listen(3000, () => console.log('Relay ready (openrouter.ai mode)'));
+server.listen(3000, () => console.log('Relay ready (openrouter.ai + env key mode)'));
