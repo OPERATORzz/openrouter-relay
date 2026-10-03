@@ -6,6 +6,9 @@ const tls = require('tls');
 
 const app = express();
 app.get('/', (req, res) => res.send('Relay OK'));
+app.get('/api/v1/models', (req, res) => {
+  res.status(200).json({ data: [{ id: 'qwen/qwen2.5-vl-72b-instruct' }, { id: 'openai/gpt-4o-mini' }] });
+});
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
