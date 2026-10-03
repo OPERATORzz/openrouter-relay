@@ -23,7 +23,6 @@ wss.on('connection', (ws) => {
                     upstream = tls.connect({ socket, servername: host }, () => {
                         upstream.write(req.data);
                     });
-                    // ВОТ ИСПРАВЛЕНИЕ: отправляем ответ обратно через WebSocket
                     upstream.on('data', (d) => {
                         if (ws.readyState === 1) ws.send(d.toString('base64'));
                     });
