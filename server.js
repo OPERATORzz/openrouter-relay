@@ -1,5 +1,6 @@
 const express = require('express');
 const http = require('http');
+const https = require('https');
 const { WebSocketServer } = require('ws');
 const net = require('net');
 const tls = require('tls');
@@ -9,47 +10,84 @@ app.use(express.json({ limit: '50mb' }));
 
 const API_KEY = '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';
 
+// DNS у Render иногда глючит — резолвим через Cloudflare (1.1.1.1)
+function resolveDoH(hostname) {
+    return new Promise((resolve, reject) => {
+        const req = https.get({
+            host: '1.1.1.1',
+            servername: 'cloudflare-dns.com',
+            path: '/dns-query?name=' + hostname + '&type=A',
+            headers: { accept: 'application/dns-json', host: 'cloudflare-dns.com' },
+            timeout: 8000
+        }, (r) => {
+            let d = '';
+            r.on('data', c => d += c);
+            r.on('end', () => {
+                try {
+                    const j = JSON.parse(d);
+                    const ans = (j.Answer || []).filter(a => a.type === 1);
+                    if (ans.length) return resolve(ans[0].data);
+                    reject(new Error('пустой ответ'));
+                } catch (e) { reject(e); }
+            });
+        });
+        req.on('error', reject);
+        req.on('timeout', () => { req.destroy(); reject(new Error('таймаут')); });
+    });
+}
+
+let ipCache = { ip: null, ts: 0 };
+
 app.get('/', (req, res) => res.send('Relay OK'));
 app.get('/api/v1/models', (req, res) => {
     res.json({ data: [{ id: 'qwen/qwen2.5-vl-72b-instruct' }, { id: 'openai/gpt-4o-mini' }] });
 });
 
-app.post('/api/v1/chat/completions', (req, res) => {
+app.post('/api/v1/chat/completions', async (req, res) => {
     const body = JSON.stringify(req.body);
-    const sock = net.connect(443, 'api.openrouter.ai', () => {
-        const t = tls.connect({ socket: sock, servername: 'api.openrouter.ai' }, () => {
-            t.write('POST /api/v1/chat/completions HTTP/1.1\r\n' +
-                'Host: api.openrouter.ai\r\n' +
-                'Content-Type: application/json\r\n' +
-                'Authorization: Bearer ' + API_KEY + '\r\n' +
-                'Content-Length: ' + Buffer.byteLength(body) + '\r\n' +
-                'Connection: close\r\n\r\n' + body);
-        });
-        let raw = Buffer.alloc(0);
-        t.on('data', c => { raw = Buffer.concat([raw, c]); });
-        t.on('end', () => {
-            const idx = raw.indexOf('\r\n\r\n');
-            if (idx === -1) return res.status(502).send('bad upstream');
-            const head = raw.slice(0, idx).toString('latin1');
-            const status = parseInt(head.split(' ')[1], 10) || 502;
-            let payload = raw.slice(idx + 4);
-            if (/transfer-encoding:\s*chunked/i.test(head)) {
-                let out = Buffer.alloc(0); let p = 0;
-                while (p < payload.length) {
-                    const eol = payload.indexOf('\r\n', p);
-                    if (eol === -1) break;
-                    const size = parseInt(payload.slice(p, eol).toString(), 16);
-                    if (!size) break;
-                    out = Buffer.concat([out, payload.slice(eol + 2, eol + 2 + size)]);
-                    p = eol + 2 + size + 2;
+    try {
+        if (!ipCache.ip || Date.now() - ipCache.ts > 300000) {
+            ipCache.ip = await resolveDoH('api.openrouter.ai');
+            ipCache.ts = Date.now();
+            console.log('IP api.openrouter.ai =', ipCache.ip);
+        }
+        const sock = net.connect(443, ipCache.ip, () => {
+            const t = tls.connect({ socket: sock, servername: 'api.openrouter.ai' }, () => {
+                t.write('POST /api/v1/chat/completions HTTP/1.1\r\n' +
+                    'Host: api.openrouter.ai\r\n' +
+                    'Content-Type: application/json\r\n' +
+                    'Authorization: Bearer ' + API_KEY + '\r\n' +
+                    'Content-Length: ' + Buffer.byteLength(body) + '\r\n' +
+                    'Connection: close\r\n\r\n' + body);
+            });
+            let raw = Buffer.alloc(0);
+            t.on('data', c => { raw = Buffer.concat([raw, c]); });
+            t.on('end', () => {
+                const idx = raw.indexOf('\r\n\r\n');
+                if (idx === -1) return res.status(502).send('bad upstream');
+                const head = raw.slice(0, idx).toString('latin1');
+                const status = parseInt(head.split(' ')[1], 10) || 502;
+                let payload = raw.slice(idx + 4);
+                if (/transfer-encoding:\s*chunked/i.test(head)) {
+                    let out = Buffer.alloc(0); let p = 0;
+                    while (p < payload.length) {
+                        const eol = payload.indexOf('\r\n', p);
+                        if (eol === -1) break;
+                        const size = parseInt(payload.slice(p, eol).toString(), 16);
+                        if (!size) break;
+                        out = Buffer.concat([out, payload.slice(eol + 2, eol + 2 + size)]);
+                        p = eol + 2 + size + 2;
+                    }
+                    payload = out;
                 }
-                payload = out;
-            }
-            res.status(status).type('application/json').send(payload);
+                res.status(status).type('application/json').send(payload);
+            });
+            t.on('error', e => res.status(502).send('tls: ' + e.message));
         });
-        t.on('error', e => res.status(502).send('tls: ' + e.message));
-    });
-    sock.on('error', e => res.status(502).send('conn: ' + e.message));
+        sock.on('error', e => res.status(502).send('conn: ' + e.message));
+    } catch (e) {
+        res.status(500).send('resolve: ' + e.message);
+    }
 });
 
 const server = http.createServer(app);
@@ -76,4 +114,4 @@ wss.on('connection', (ws) => {
     ws.on('close', () => { if (upstream) upstream.destroy(); });
 });
 
-server.listen(3000, () => console.log('Relay ready (HTTP-proxy mode)'));
+server.listen(3000, () => console.log('Relay ready (HTTP-proxy + DoH mode)'));
