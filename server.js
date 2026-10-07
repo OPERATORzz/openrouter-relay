@@ -11,7 +11,7 @@ app.use(express.json({ limit: '50mb' }));
 
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 const GROQ_KEY = process.env.GROQ_API_KEY || '';
-const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.2-90b-vision';
+const GROQ_MODEL = process.env.GROQ_MODEL || 'meta-llama/llama-4-maverick-17b-128e-instruct';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const GEMINI_HOST = 'generativelanguage.googleapis.com';
 const GROQ_HOST = 'api.groq.com';
@@ -164,28 +164,47 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-// ── Провайдеры: GROQ (основной) → GEMINI (запасной) ──
-app.get('/', (req, res) => res.send('Relay OK (GROQ primary + DoH)'));
+// ── Провайдеры: GROQ (с автоперебором моделей) → GEMINI ──
+app.get('/', (req, res) => res.send('Relay OK (GROQ auto-model + DoH)'));
 app.get('/api/v1/models', (req, res) => {
-    res.json({ data: [{ id: GROQ_MODEL }, { id: 'gemini-3.8-flash' }] });
+    res.json({ data: [{ id: 'groq-vision' }, { id: 'gemini-3.8-flash' }] });
 });
+
+const GROQ_MODELS = [
+    GROQ_MODEL,
+    'meta-llama/llama-4-scout-17b-16e-instruct',
+    'meta-llama/llama-4-maverick-17b-128e-instruct',
+    'llama-3.2-90b-vision',
+    'llama-3.2-11b-vision',
+];
 
 function sendGroq(oai, res, done) {
     if (!GROQ_KEY) return done(false, 401, Buffer.from('no GROQ_API_KEY'));
-    const body = JSON.stringify({
-        model: GROQ_MODEL,
-        temperature: (oai.temperature != null ? oai.temperature : 0.2),
-        messages: oai.messages,
-        max_tokens: 1500,
-    });
-    rawHttp(GROQ_HOST, '/openai/v1/chat/completions', 'POST',
-        [['Content-Type', 'application/json'], ['Authorization', 'Bearer ' + GROQ_KEY]], body)
-        .then(r => {
-            if (r.status !== 200) return done(false, r.status, r.body);
-            if (!r.body.toString().includes('"choices"')) return done(false, 502, Buffer.from('bad body: ' + r.body.toString().slice(0, 100)));
-            done(true, 200, r.body);
-        })
-        .catch(e => done(false, 502, Buffer.from('conn: ' + e.message)));
+    let mi = 0;
+    const tryM = () => {
+        if (mi >= GROQ_MODELS.length) return done(false, 404, Buffer.from('ни одна vision-модель Groq не найдена'));
+        const model = GROQ_MODELS[mi++];
+        const body = JSON.stringify({
+            model: model,
+            temperature: (oai.temperature != null ? oai.temperature : 0.2),
+            messages: oai.messages,
+            max_tokens: 1500,
+        });
+        rawHttp(GROQ_HOST, '/openai/v1/chat/completions', 'POST',
+            [['Content-Type', 'application/json'], ['Authorization', 'Bearer ' + GROQ_KEY]], body)
+            .then(r => {
+                if (r.status === 404 && r.body.toString().includes('model_not_found')) {
+                    console.log('<- GROQ: модель', model, 'не найдена, пробую следующую');
+                    return tryM();
+                }
+                if (r.status !== 200) return done(false, r.status, r.body);
+                if (!r.body.toString().includes('"choices"')) return done(false, 502, Buffer.from('bad body: ' + r.body.toString().slice(0, 80)));
+                console.log('<- GROQ OK, модель:', model);
+                done(true, 200, r.body);
+            })
+            .catch(e => done(false, 502, Buffer.from('conn: ' + e.message)));
+    };
+    tryM();
 }
 
 function sendGemini(oai, res, done) {
@@ -273,4 +292,4 @@ wss.on('connection', (ws) => {
     ws.on('close', () => { if (upstream) upstream.destroy(); });
 });
 
-server.listen(3000, () => console.log('Relay ready (GROQ primary + DoH)'));
+server.listen(3000, () => console.log('Relay ready (GROQ auto-model + DoH)'));
