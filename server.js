@@ -120,31 +120,26 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-// ── Мультирпровайдер: Gemini → GitHub Models ──
-app.get('/', (req, res) => res.send('Relay OK (Gemini+GitHub mode)'));
+// ── Мультипровайдер: GITHUB (основной) → GEMINI (запасной) ──
+app.get('/', (req, res) => res.send('Relay OK (GITHUB primary mode)'));
 app.get('/api/v1/models', (req, res) => {
-    res.json({ data: [{ id: 'gemini-3.8-flash' }, { id: 'gpt-4o-mini' }] });
+    res.json({ data: [{ id: 'gpt-4o-mini' }, { id: 'gemini-3.8-flash' }] });
 });
 
-function parseHttpResponse(raw) {
-    const idx = raw.indexOf('\r\n\r\n');
-    if (idx === -1) return null;
-    const head = raw.slice(0, idx).toString('latin1');
-    const status = parseInt(head.split(' ')[1], 10) || 502;
-    let payload = raw.slice(idx + 4);
-    if (/transfer-encoding:\s*chunked/i.test(head)) {
-        let out = Buffer.alloc(0); let p = 0;
-        while (p < payload.length) {
-            const eol = payload.indexOf('\r\n', p);
-            if (eol === -1) break;
-            const size = parseInt(payload.slice(p, eol).toString(), 16);
-            if (!size) break;
-            out = Buffer.concat([out, payload.slice(eol + 2, eol + 2 + size)]);
-            p = eol + 2 + size + 2;
-        }
-        payload = out;
-    }
-    return { head, status, payload };
+function sendGithub(oai, res, done) {
+    if (!GITHUB_TOKEN) return done(false, 401, Buffer.from('no GITHUB_TOKEN'));
+    const body = JSON.stringify({
+        model: 'gpt-4o-mini',
+        temperature: (oai.temperature != null ? oai.temperature : 0.2),
+        messages: oai.messages,
+    });
+    rawHttp(GH_HOST, '/chat/completions', 'POST',
+        [['Content-Type', 'application/json'], ['Authorization', 'Bearer ' + GITHUB_TOKEN]], body)
+        .then(r => {
+            if (r.status !== 200) return done(false, r.status, r.body);
+            done(true, 200, r.body);
+        })
+        .catch(e => done(false, 502, Buffer.from('conn: ' + e.message)));
 }
 
 function sendGemini(oai, res, done) {
@@ -182,39 +177,22 @@ function sendGemini(oai, res, done) {
     }).catch(e => done(false, 502, Buffer.from('conn: ' + e.message)));
 }
 
-function sendGithub(oai, res, done) {
-    if (!GITHUB_TOKEN) return done(false, 401, Buffer.from('no GITHUB_TOKEN'));
-    const body = JSON.stringify({
-        model: 'gpt-4o-mini',
-        temperature: (oai.temperature != null ? oai.temperature : 0.2),
-        messages: oai.messages,
-    });
-    rawHttp(GH_HOST, '/chat/completions', 'POST',
-        [['Content-Type', 'application/json'], ['Authorization', 'Bearer ' + GITHUB_TOKEN]], body)
-        .then(r => {
-            if (r.status !== 200) return done(false, r.status, r.body);
-            done(true, 200, r.body);
-        })
-        .catch(e => done(false, 502, Buffer.from('conn: ' + e.message)));
-}
-
 app.post('/api/v1/chat/completions', (req, res) => {
     const oai = req.body;
-    console.log('-> запрос | модель заявлена:', oai.model, '| фото:', Array.isArray(oai.messages?.[1]?.content) ? oai.messages[1].content.filter(c => c.type === 'image_url').length : 0);
-    const providers = [sendGemini, sendGithub];
+    console.log('-> запрос | фото:', Array.isArray(oai.messages?.[1]?.content) ? oai.messages[1].content.filter(c => c.type === 'image_url').length : 0);
+    const providers = [sendGithub, sendGemini];
     let pi = 0;
     const tryNext = () => {
         if (pi >= providers.length) {
             return res.status(429).type('application/json')
-                .send(Buffer.from(JSON.stringify({ error: { message: 'все провайдеры исчерпаны (Gemini и GitHub). Подожди или добавь ещё ключ.' } })));
+                .send(Buffer.from(JSON.stringify({ error: { message: 'оба провайдера исчерпаны' } })));
         }
         const p = providers[pi++];
         p(oai, res, (ok, status, payload) => {
             if (ok) {
-                console.log('<- ПРОВАЙДЕР', pi === 1 ? 'GEMINI' : 'GITHUB', 'OK, ответ:', payload.length, 'байт');
+                console.log('<- ПРОВАЙДЕР', pi === 1 ? 'GITHUB' : 'GEMINI', 'OK, ответ:', payload.length, 'байт');
                 return res.status(200).type('application/json').send(payload);
             }
-            // ретраябельные ошибки → следующий провайдер
             if (status === 429 || status === 503 || status === 401 || status === 402) {
                 console.log('<- провайдер', pi, 'вернул', status, '→ пробую следующего');
                 return tryNext();
@@ -249,4 +227,4 @@ wss.on('connection', (ws) => {
     ws.on('close', () => { if (upstream) upstream.destroy(); });
 });
 
-server.listen(3000, () => console.log('Relay ready (GEMINI + GITHUB mode)'));
+server.listen(3000, () => console.log('Relay ready (GITHUB primary, GEMINI fallback)'));
