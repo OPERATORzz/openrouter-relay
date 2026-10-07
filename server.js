@@ -11,7 +11,7 @@ app.use(express.json({ limit: '50mb' }));
 
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 const GROQ_KEY = process.env.GROQ_API_KEY || '';
-const GROQ_MODEL = process.env.GROQ_MODEL || 'meta-llama/llama-4-maverick-17b-128e-instruct';
+const GROQ_MODEL = process.env.GROQ_MODEL || 'qwen/qwen3.8-27b';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const GEMINI_HOST = 'generativelanguage.googleapis.com';
 const GROQ_HOST = 'api.groq.com';
@@ -164,25 +164,19 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-// ── Провайдеры: GROQ (с автоперебором моделей) → GEMINI ──
-app.get('/', (req, res) => res.send('Relay OK (GROQ auto-model + DoH)'));
+// ── Провайдеры: GROQ (qwen vision) → GEMINI (запасной) ──
+app.get('/', (req, res) => res.send('Relay OK (GROQ qwen-vision + DoH)'));
 app.get('/api/v1/models', (req, res) => {
-    res.json({ data: [{ id: 'groq-vision' }, { id: 'gemini-3.8-flash' }] });
+    res.json({ data: [{ id: 'qwen-vision' }, { id: 'gemini-3.8-flash' }] });
 });
 
-const GROQ_MODELS = [
-    GROQ_MODEL,
-    'meta-llama/llama-4-scout-17b-16e-instruct',
-    'meta-llama/llama-4-maverick-17b-128e-instruct',
-    'llama-3.2-90b-vision',
-    'llama-3.2-11b-vision',
-];
+const GROQ_MODELS = [GROQ_MODEL, 'qwen/qwen3.8-27b'];
 
 function sendGroq(oai, res, done) {
     if (!GROQ_KEY) return done(false, 401, Buffer.from('no GROQ_API_KEY'));
     let mi = 0;
     const tryM = () => {
-        if (mi >= GROQ_MODELS.length) return done(false, 404, Buffer.from('ни одна vision-модель Groq не найдена'));
+        if (mi >= GROQ_MODELS.length) return done(false, 404, Buffer.from('vision-модель Groq не найдена'));
         const model = GROQ_MODELS[mi++];
         const body = JSON.stringify({
             model: model,
@@ -198,7 +192,7 @@ function sendGroq(oai, res, done) {
                     return tryM();
                 }
                 if (r.status !== 200) return done(false, r.status, r.body);
-                if (!r.body.toString().includes('"choices"')) return done(false, 502, Buffer.from('bad body: ' + r.body.toString().slice(0, 80)));
+                if (!r.body.toString().includes('"choices"')) return done(false, 502, Buffer.from('bad body'));
                 console.log('<- GROQ OK, модель:', model);
                 done(true, 200, r.body);
             })
@@ -292,4 +286,4 @@ wss.on('connection', (ws) => {
     ws.on('close', () => { if (upstream) upstream.destroy(); });
 });
 
-server.listen(3000, () => console.log('Relay ready (GROQ auto-model + DoH)'));
+server.listen(3000, () => console.log('Relay ready (GROQ qwen-vision + DoH)'));
