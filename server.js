@@ -10,12 +10,13 @@ const app = express();
 app.use(express.json({ limit: '50mb' }));
 
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
+const GROQ_KEY = process.env.GROQ_API_KEY || '';
+const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.2-90b-vision';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const GEMINI_HOST = 'generativelanguage.googleapis.com';
-const GH_HOST = 'models.github.ai';
+const GROQ_HOST = 'api.groq.com';
 
-// ── DNS: системный, при провале — DoH через Cloudflare/Google ──
+// ── DNS: системный → DoH ──
 function dohResolve(hostname) {
     return new Promise((resolve, reject) => {
         const servers = [
@@ -27,8 +28,7 @@ function dohResolve(hostname) {
             if (i >= servers.length) return reject(new Error('DoH failed: ' + hostname));
             const s = servers[i++];
             const req = https.get({
-                host: s.ip,
-                servername: s.name,
+                host: s.ip, servername: s.name,
                 path: '/dns-query?name=' + hostname + '&type=A',
                 headers: { accept: 'application/dns-json', host: s.name },
                 timeout: 8000,
@@ -59,7 +59,6 @@ async function resolveAny(hostname) {
     catch (e) { const ip = await dohResolve(hostname); return { address: ip }; }
 }
 
-// ── Универсальный HTTPS-запрос через TLS ──
 function rawHttp(host, path, method, headers, body) {
     method = method || 'GET';
     headers = headers || [];
@@ -165,29 +164,28 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-// ── Мультипровайдер: GITHUB models.github.ai (основной) → GEMINI (запасной) ──
-app.get('/', (req, res) => res.send('Relay OK (models.github.ai mode)'));
+// ── Провайдеры: GROQ (основной) → GEMINI (запасной) ──
+app.get('/', (req, res) => res.send('Relay OK (GROQ primary + DoH)'));
 app.get('/api/v1/models', (req, res) => {
-    res.json({ data: [{ id: 'gpt-4o-mini' }, { id: 'gemini-3.8-flash' }] });
+    res.json({ data: [{ id: GROQ_MODEL }, { id: 'gemini-3.8-flash' }] });
 });
 
-function sendGithub(oai, res, done) {
-    if (!GITHUB_TOKEN) return done(false, 401, Buffer.from('no GITHUB_TOKEN'));
-    const tryModelName = (modelName) => {
-        const body = JSON.stringify({
-            model: modelName,
-            temperature: (oai.temperature != null ? oai.temperature : 0.2),
-            messages: oai.messages,
-        });
-        return rawHttp(GH_HOST, '/inference/chat/completions', 'POST',
-            [['Content-Type', 'application/json'], ['Authorization', 'Bearer ' + GITHUB_TOKEN]], body)
-            .then(r => {
-                if (r.status === 404 && modelName !== 'gpt-4o-mini') return tryModelName('gpt-4o-mini');
-                if (r.status !== 200) return done(false, r.status, r.body);
-                done(true, 200, r.body);
-            });
-    };
-    tryModelName('openai/gpt-4o-mini').catch(e => done(false, 502, Buffer.from('conn: ' + e.message)));
+function sendGroq(oai, res, done) {
+    if (!GROQ_KEY) return done(false, 401, Buffer.from('no GROQ_API_KEY'));
+    const body = JSON.stringify({
+        model: GROQ_MODEL,
+        temperature: (oai.temperature != null ? oai.temperature : 0.2),
+        messages: oai.messages,
+        max_tokens: 1500,
+    });
+    rawHttp(GROQ_HOST, '/openai/v1/chat/completions', 'POST',
+        [['Content-Type', 'application/json'], ['Authorization', 'Bearer ' + GROQ_KEY]], body)
+        .then(r => {
+            if (r.status !== 200) return done(false, r.status, r.body);
+            if (!r.body.toString().includes('"choices"')) return done(false, 502, Buffer.from('bad body: ' + r.body.toString().slice(0, 100)));
+            done(true, 200, r.body);
+        })
+        .catch(e => done(false, 502, Buffer.from('conn: ' + e.message)));
 }
 
 function sendGemini(oai, res, done) {
@@ -228,7 +226,7 @@ function sendGemini(oai, res, done) {
 app.post('/api/v1/chat/completions', (req, res) => {
     const oai = req.body;
     console.log('-> запрос | фото:', Array.isArray(oai.messages?.[1]?.content) ? oai.messages[1].content.filter(c => c.type === 'image_url').length : 0);
-    const providers = [sendGithub, sendGemini];
+    const providers = [sendGroq, sendGemini];
     let pi = 0;
     const tryNext = () => {
         if (pi >= providers.length) {
@@ -238,7 +236,7 @@ app.post('/api/v1/chat/completions', (req, res) => {
         const p = providers[pi++];
         p(oai, res, (ok, status, payload) => {
             if (ok) {
-                console.log('<- ПРОВАЙДЕР', pi === 1 ? 'GITHUB' : 'GEMINI', 'OK, ответ:', payload.length, 'байт');
+                console.log('<- ПРОВАЙДЕР', pi === 1 ? 'GROQ' : 'GEMINI', 'OK, ответ:', payload.length, 'байт');
                 return res.status(200).type('application/json').send(payload);
             }
             if (status === 429 || status === 503 || status === 401 || status === 402) {
@@ -275,4 +273,4 @@ wss.on('connection', (ws) => {
     ws.on('close', () => { if (upstream) upstream.destroy(); });
 });
 
-server.listen(3000, () => console.log('Relay ready (models.github.ai primary + DoH)'));
+server.listen(3000, () => console.log('Relay ready (GROQ primary + DoH)'));
