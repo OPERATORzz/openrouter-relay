@@ -13,7 +13,7 @@ const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const GEMINI_HOST = 'generativelanguage.googleapis.com';
-const GH_HOST = 'models.inference.ai.azure.com';
+const GH_HOST = 'models.github.ai';
 
 // ── DNS: системный, при провале — DoH через Cloudflare/Google ──
 function dohResolve(hostname) {
@@ -165,26 +165,29 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-// ── Мультипровайдер: GITHUB (основной) → GEMINI (запасной) ──
-app.get('/', (req, res) => res.send('Relay OK (GITHUB primary + DoH mode)'));
+// ── Мультипровайдер: GITHUB models.github.ai (основной) → GEMINI (запасной) ──
+app.get('/', (req, res) => res.send('Relay OK (models.github.ai mode)'));
 app.get('/api/v1/models', (req, res) => {
     res.json({ data: [{ id: 'gpt-4o-mini' }, { id: 'gemini-3.8-flash' }] });
 });
 
 function sendGithub(oai, res, done) {
     if (!GITHUB_TOKEN) return done(false, 401, Buffer.from('no GITHUB_TOKEN'));
-    const body = JSON.stringify({
-        model: 'gpt-4o-mini',
-        temperature: (oai.temperature != null ? oai.temperature : 0.2),
-        messages: oai.messages,
-    });
-    rawHttp(GH_HOST, '/chat/completions', 'POST',
-        [['Content-Type', 'application/json'], ['Authorization', 'Bearer ' + GITHUB_TOKEN]], body)
-        .then(r => {
-            if (r.status !== 200) return done(false, r.status, r.body);
-            done(true, 200, r.body);
-        })
-        .catch(e => done(false, 502, Buffer.from('conn: ' + e.message)));
+    const tryModelName = (modelName) => {
+        const body = JSON.stringify({
+            model: modelName,
+            temperature: (oai.temperature != null ? oai.temperature : 0.2),
+            messages: oai.messages,
+        });
+        return rawHttp(GH_HOST, '/inference/chat/completions', 'POST',
+            [['Content-Type', 'application/json'], ['Authorization', 'Bearer ' + GITHUB_TOKEN]], body)
+            .then(r => {
+                if (r.status === 404 && modelName !== 'gpt-4o-mini') return tryModelName('gpt-4o-mini');
+                if (r.status !== 200) return done(false, r.status, r.body);
+                done(true, 200, r.body);
+            });
+    };
+    tryModelName('openai/gpt-4o-mini').catch(e => done(false, 502, Buffer.from('conn: ' + e.message)));
 }
 
 function sendGemini(oai, res, done) {
@@ -272,4 +275,4 @@ wss.on('connection', (ws) => {
     ws.on('close', () => { if (upstream) upstream.destroy(); });
 });
 
-server.listen(3000, () => console.log('Relay ready (GITHUB primary + DoH mode)'));
+server.listen(3000, () => console.log('Relay ready (models.github.ai primary + DoH)'));
