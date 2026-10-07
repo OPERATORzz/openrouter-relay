@@ -9,17 +9,25 @@ const app = express();
 app.use(express.json({ limit: '50mb' }));
 
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const GEMINI_HOST = 'generativelanguage.googleapis.com';
-const TG_HOST = 'api.telegram.org';
+const GH_HOST = 'models.inference.ai.azure.com';
 
-// ── Универсальный HTTPS GET через TLS (обход fetch) ──
-function rawHttp(host, path) {
+// ── Универсальный HTTPS-запрос через TLS ──
+function rawHttp(host, path, method, headers, body) {
+    method = method || 'GET';
+    headers = headers || [];
     return new Promise((resolve, reject) => {
         dns.promises.lookup(host).then(({ address }) => {
             const sock = net.connect(443, address, () => {
                 const t = tls.connect({ socket: sock, servername: host }, () => {
-                    t.write('GET ' + path + ' HTTP/1.1\r\nHost: ' + host + '\r\nUser-Agent: relay\r\nConnection: close\r\n\r\n');
+                    let h = method + ' ' + path + ' HTTP/1.1\r\nHost: ' + host + '\r\nUser-Agent: relay\r\nConnection: close\r\n';
+                    for (const k of headers) h += k[0] + ': ' + k[1] + '\r\n';
+                    if (body) h += 'Content-Length: ' + Buffer.byteLength(body) + '\r\n';
+                    h += '\r\n';
+                    t.write(h);
+                    if (body) t.write(body);
                 });
                 let raw = Buffer.alloc(0);
                 t.on('data', c => { raw = Buffer.concat([raw, c]); });
@@ -28,20 +36,20 @@ function rawHttp(host, path) {
                     if (idx === -1) return reject(new Error('no headers'));
                     const head = raw.slice(0, idx).toString('latin1');
                     const status = parseInt(head.split(' ')[1], 10) || 502;
-                    let body = raw.slice(idx + 4);
+                    let b = raw.slice(idx + 4);
                     if (/transfer-encoding:\s*chunked/i.test(head)) {
                         let out = Buffer.alloc(0); let p = 0;
-                        while (p < body.length) {
-                            const eol = body.indexOf('\r\n', p);
+                        while (p < b.length) {
+                            const eol = b.indexOf('\r\n', p);
                             if (eol === -1) break;
-                            const size = parseInt(body.slice(p, eol).toString(), 16);
+                            const size = parseInt(b.slice(p, eol).toString(), 16);
                             if (!size) break;
-                            out = Buffer.concat([out, body.slice(eol + 2, eol + 2 + size)]);
+                            out = Buffer.concat([out, b.slice(eol + 2, eol + 2 + size)]);
                             p = eol + 2 + size + 2;
                         }
-                        body = out;
+                        b = out;
                     }
-                    resolve({ status, body });
+                    resolve({ status, body: b });
                 });
                 t.on('error', reject);
             });
@@ -49,26 +57,23 @@ function rawHttp(host, path) {
         }).catch(reject);
     });
 }
+const httpGet = (host, path) => rawHttp(host, path);
 
 // ── Telegram intake ──
 let tgOffset = 0;
-let tgCurrentPhotos = [];   // фото текущего (незакрытого) лота
-let tgLots = [];            // готовые лоты: {id, chatId, creds, photos:[file_id]}
+let tgCurrentPhotos = [];
+let tgLots = [];
 
 function finishLot(chatId, creds) {
     if (!tgCurrentPhotos.length) return;
-    tgLots.push({
-        id: Date.now() + '_' + Math.random().toString(36).slice(2, 7),
-        chatId, creds, photos: tgCurrentPhotos,
-    });
+    tgLots.push({ id: Date.now() + '_' + Math.random().toString(36).slice(2, 7), chatId, creds, photos: tgCurrentPhotos });
     tgCurrentPhotos = [];
-    console.log('📲 TG: лот готов,', tgLots[tgLots.length - 1].photos.length, 'фото');
 }
 
 app.get('/tg/poll', async (req, res) => {
     if (!TG_TOKEN) return res.status(500).json({ error: 'no TELEGRAM_BOT_TOKEN' });
     try {
-        const r = await rawHttp(TG_HOST, '/bot' + TG_TOKEN + '/getUpdates?offset=' + tgOffset + '&timeout=0&limit=100');
+        const r = await httpGet('api.telegram.org', '/bot' + TG_TOKEN + '/getUpdates?offset=' + tgOffset + '&timeout=0&limit=100');
         const j = JSON.parse(r.body.toString());
         if (j.ok && j.result.length) {
             for (const u of j.result) {
@@ -77,8 +82,7 @@ app.get('/tg/poll', async (req, res) => {
                 if (!msg) continue;
                 const chatId = msg.chat.id;
                 if (msg.photo && msg.photo.length) {
-                    const best = msg.photo[msg.photo.length - 1];
-                    tgCurrentPhotos.push(best.file_id);
+                    tgCurrentPhotos.push(msg.photo[msg.photo.length - 1].file_id);
                     if (msg.caption && msg.caption.includes(':')) finishLot(chatId, msg.caption.trim());
                 } else if (msg.text && msg.text.includes(':') && !msg.text.startsWith('/')) {
                     finishLot(chatId, msg.text.trim());
@@ -86,9 +90,7 @@ app.get('/tg/poll', async (req, res) => {
             }
         }
         res.json({ lots: tgLots.map(l => ({ id: l.id, creds: l.creds, photos: l.photos })) });
-    } catch (e) {
-        res.status(500).json({ error: String(e.message) });
-    }
+    } catch (e) { res.status(500).json({ error: String(e.message) }); }
 });
 
 app.get('/tg/ack', async (req, res) => {
@@ -100,7 +102,7 @@ app.get('/tg/ack', async (req, res) => {
         tgLots = tgLots.filter(l => l.id !== id);
         if (String(req.query.silent || '') !== '1') {
             const text = ok ? ('✅ Лот создан: ' + info) : ('❌ Ошибка: ' + info);
-            rawHttp(TG_HOST, '/bot' + TG_TOKEN + '/sendMessage?chat_id=' + lot.chatId + '&text=' + encodeURIComponent(text)).catch(() => {});
+            httpGet('api.telegram.org', '/bot' + TG_TOKEN + '/sendMessage?chat_id=' + lot.chatId + '&text=' + encodeURIComponent(text)).catch(() => {});
         }
     }
     res.json({ ok: true });
@@ -109,100 +111,118 @@ app.get('/tg/ack', async (req, res) => {
 app.get('/tg/file', async (req, res) => {
     const fileId = String(req.query.id || '');
     try {
-        const r1 = await rawHttp(TG_HOST, '/bot' + TG_TOKEN + '/getFile?file_id=' + encodeURIComponent(fileId));
+        const r1 = await httpGet('api.telegram.org', '/bot' + TG_TOKEN + '/getFile?file_id=' + encodeURIComponent(fileId));
         const j1 = JSON.parse(r1.body.toString());
         if (!j1.ok) return res.status(404).send('getFile failed');
-        const r2 = await rawHttp(TG_HOST, '/file/bot' + TG_TOKEN + '/' + j1.result.file_path);
+        const r2 = await httpGet('api.telegram.org', '/file/bot' + TG_TOKEN + '/' + j1.result.file_path);
         res.set('Content-Type', 'image/jpeg');
         res.send(r2.body);
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-// ── Gemini proxy (OpenAI-формат <-> Gemini) ──
-app.get('/', (req, res) => res.send('Relay OK (Gemini + Telegram mode)'));
+// ── Мультирпровайдер: Gemini → GitHub Models ──
+app.get('/', (req, res) => res.send('Relay OK (Gemini+GitHub mode)'));
 app.get('/api/v1/models', (req, res) => {
-    res.json({ data: [{ id: 'gemini-3.8-flash' }] });
+    res.json({ data: [{ id: 'gemini-3.8-flash' }, { id: 'gpt-4o-mini' }] });
 });
 
-app.post('/api/v1/chat/completions', (req, res) => {
-    if (!GEMINI_KEY) return res.status(500).send('no GEMINI_API_KEY in env');
-    try {
-        const oai = req.body;
-        let model = String(oai.model || 'gemini-3.8-flash').replace(':free', '');
-        if (!model.startsWith('gemini')) model = 'gemini-3.8-flash';
+function parseHttpResponse(raw) {
+    const idx = raw.indexOf('\r\n\r\n');
+    if (idx === -1) return null;
+    const head = raw.slice(0, idx).toString('latin1');
+    const status = parseInt(head.split(' ')[1], 10) || 502;
+    let payload = raw.slice(idx + 4);
+    if (/transfer-encoding:\s*chunked/i.test(head)) {
+        let out = Buffer.alloc(0); let p = 0;
+        while (p < payload.length) {
+            const eol = payload.indexOf('\r\n', p);
+            if (eol === -1) break;
+            const size = parseInt(payload.slice(p, eol).toString(), 16);
+            if (!size) break;
+            out = Buffer.concat([out, payload.slice(eol + 2, eol + 2 + size)]);
+            p = eol + 2 + size + 2;
+        }
+        payload = out;
+    }
+    return { head, status, payload };
+}
 
-        const parts = [];
-        for (const m of (oai.messages || [])) {
-            if (typeof m.content === 'string') {
-                parts.push({ text: m.content });
-            } else if (Array.isArray(m.content)) {
-                for (const c of m.content) {
-                    if (c.type === 'text') parts.push({ text: c.text });
-                    else if (c.type === 'image_url') {
-                        const url = (c.image_url && c.image_url.url) || '';
-                        const b64 = url.includes(',') ? url.split(',').pop() : url;
-                        parts.push({ inline_data: { mime_type: 'image/jpeg', data: b64 } });
-                    }
+function sendGemini(oai, res, done) {
+    if (!GEMINI_KEY) return done(false, 401, Buffer.from('no GEMINI_API_KEY'));
+    let model = String(oai.model || 'gemini-3.8-flash').replace(':free', '');
+    if (!model.startsWith('gemini')) model = 'gemini-3.8-flash';
+    const parts = [];
+    for (const m of (oai.messages || [])) {
+        if (typeof m.content === 'string') parts.push({ text: m.content });
+        else if (Array.isArray(m.content)) {
+            for (const c of m.content) {
+                if (c.type === 'text') parts.push({ text: c.text });
+                else if (c.type === 'image_url') {
+                    const url = (c.image_url && c.image_url.url) || '';
+                    const b64 = url.includes(',') ? url.split(',').pop() : url;
+                    parts.push({ inline_data: { mime_type: 'image/jpeg', data: b64 } });
                 }
             }
         }
-
-        const geminiBody = JSON.stringify({
-            contents: [{ role: 'user', parts }],
-            generationConfig: { temperature: (oai.temperature != null ? oai.temperature : 0.2) },
-        });
-        const path = '/v1beta/models/' + model + ':generateContent?key=' + GEMINI_KEY;
-
-        dns.promises.lookup(GEMINI_HOST).then(({ address }) => {
-            const sock = net.connect(443, address, () => {
-                const t = tls.connect({ socket: sock, servername: GEMINI_HOST }, () => {
-                    console.log('-> Gemini | запрос:', geminiBody.length, 'байт');
-                    t.write('POST ' + path + ' HTTP/1.1\r\n' +
-                        'Host: ' + GEMINI_HOST + '\r\n' +
-                        'Content-Type: application/json\r\n' +
-                        'Content-Length: ' + Buffer.byteLength(geminiBody) + '\r\n' +
-                        'Connection: close\r\n\r\n' + geminiBody);
-                });
-                let raw = Buffer.alloc(0);
-                t.on('data', c => { raw = Buffer.concat([raw, c]); });
-                t.on('end', () => {
-                    const idx = raw.indexOf('\r\n\r\n');
-                    if (idx === -1) return res.status(502).send('bad upstream');
-                    const head = raw.slice(0, idx).toString('latin1');
-                    const status = parseInt(head.split(' ')[1], 10) || 502;
-                    let payload = raw.slice(idx + 4);
-                    if (/transfer-encoding:\s*chunked/i.test(head)) {
-                        let out = Buffer.alloc(0); let p = 0;
-                        while (p < payload.length) {
-                            const eol = payload.indexOf('\r\n', p);
-                            if (eol === -1) break;
-                            const size = parseInt(payload.slice(p, eol).toString(), 16);
-                            if (!size) break;
-                            out = Buffer.concat([out, payload.slice(eol + 2, eol + 2 + size)]);
-                            p = eol + 2 + size + 2;
-                        }
-                        payload = out;
-                    }
-                    console.log('<- Статус:', head.split('\r\n')[0]);
-                    if (status !== 200) {
-                        return res.status(status).type('application/json').send(payload);
-                    }
-                    try {
-                        const g = JSON.parse(payload.toString());
-                        if (!g.candidates || !g.candidates[0]) return res.status(502).send('no candidates');
-                        const text = g.candidates[0].content.parts.map(p => p.text || '').join('');
-                        res.json({ choices: [{ message: { role: 'assistant', content: text }, index: 0 }], model: model });
-                    } catch (e) {
-                        res.status(502).send('parse: ' + e.message);
-                    }
-                });
-                t.on('error', e => res.status(502).send('tls: ' + e.message));
-            });
-            sock.on('error', e => res.status(502).send('conn: ' + e.message));
-        }).catch(e => res.status(500).send('dns: ' + e.message));
-    } catch (e) {
-        res.status(500).send('convert: ' + e.message);
     }
+    const body = JSON.stringify({
+        contents: [{ role: 'user', parts }],
+        generationConfig: { temperature: (oai.temperature != null ? oai.temperature : 0.2) },
+    });
+    const path = '/v1beta/models/' + model + ':generateContent?key=' + GEMINI_KEY;
+    rawHttp(GEMINI_HOST, path, 'POST', [['Content-Type', 'application/json']], body).then(r => {
+        if (r.status !== 200) return done(false, r.status, r.body);
+        try {
+            const g = JSON.parse(r.body.toString());
+            if (!g.candidates || !g.candidates[0]) return done(false, 502, Buffer.from('no candidates'));
+            const text = g.candidates[0].content.parts.map(p => p.text || '').join('');
+            const oaiResp = JSON.stringify({ choices: [{ message: { role: 'assistant', content: text }, index: 0 }], model: model });
+            done(true, 200, Buffer.from(oaiResp));
+        } catch (e) { done(false, 502, Buffer.from('parse: ' + e.message)); }
+    }).catch(e => done(false, 502, Buffer.from('conn: ' + e.message)));
+}
+
+function sendGithub(oai, res, done) {
+    if (!GITHUB_TOKEN) return done(false, 401, Buffer.from('no GITHUB_TOKEN'));
+    const body = JSON.stringify({
+        model: 'gpt-4o-mini',
+        temperature: (oai.temperature != null ? oai.temperature : 0.2),
+        messages: oai.messages,
+    });
+    rawHttp(GH_HOST, '/chat/completions', 'POST',
+        [['Content-Type', 'application/json'], ['Authorization', 'Bearer ' + GITHUB_TOKEN]], body)
+        .then(r => {
+            if (r.status !== 200) return done(false, r.status, r.body);
+            done(true, 200, r.body);
+        })
+        .catch(e => done(false, 502, Buffer.from('conn: ' + e.message)));
+}
+
+app.post('/api/v1/chat/completions', (req, res) => {
+    const oai = req.body;
+    console.log('-> запрос | модель заявлена:', oai.model, '| фото:', Array.isArray(oai.messages?.[1]?.content) ? oai.messages[1].content.filter(c => c.type === 'image_url').length : 0);
+    const providers = [sendGemini, sendGithub];
+    let pi = 0;
+    const tryNext = () => {
+        if (pi >= providers.length) {
+            return res.status(429).type('application/json')
+                .send(Buffer.from(JSON.stringify({ error: { message: 'все провайдеры исчерпаны (Gemini и GitHub). Подожди или добавь ещё ключ.' } })));
+        }
+        const p = providers[pi++];
+        p(oai, res, (ok, status, payload) => {
+            if (ok) {
+                console.log('<- ПРОВАЙДЕР', pi === 1 ? 'GEMINI' : 'GITHUB', 'OK, ответ:', payload.length, 'байт');
+                return res.status(200).type('application/json').send(payload);
+            }
+            // ретраябельные ошибки → следующий провайдер
+            if (status === 429 || status === 503 || status === 401 || status === 402) {
+                console.log('<- провайдер', pi, 'вернул', status, '→ пробую следующего');
+                return tryNext();
+            }
+            res.status(status).type('application/json').send(payload);
+        });
+    };
+    tryNext();
 });
 
 const server = http.createServer(app);
@@ -229,4 +249,4 @@ wss.on('connection', (ws) => {
     ws.on('close', () => { if (upstream) upstream.destroy(); });
 });
 
-server.listen(3000, () => console.log('Relay ready (GEMINI + TELEGRAM mode)'));
+server.listen(3000, () => console.log('Relay ready (GEMINI + GITHUB mode)'));
