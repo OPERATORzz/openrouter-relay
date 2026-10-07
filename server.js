@@ -1,5 +1,6 @@
 const express = require('express');
 const http = require('http');
+const https = require('https');
 const { WebSocketServer } = require('ws');
 const net = require('net');
 const tls = require('tls');
@@ -14,12 +15,56 @@ const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const GEMINI_HOST = 'generativelanguage.googleapis.com';
 const GH_HOST = 'models.inference.ai.azure.com';
 
+// ── DNS: системный, при провале — DoH через Cloudflare/Google ──
+function dohResolve(hostname) {
+    return new Promise((resolve, reject) => {
+        const servers = [
+            { ip: '1.1.1.1', name: 'cloudflare-dns.com' },
+            { ip: '8.8.8.8', name: 'dns.google' },
+        ];
+        let i = 0;
+        const tryNext = () => {
+            if (i >= servers.length) return reject(new Error('DoH failed: ' + hostname));
+            const s = servers[i++];
+            const req = https.get({
+                host: s.ip,
+                servername: s.name,
+                path: '/dns-query?name=' + hostname + '&type=A',
+                headers: { accept: 'application/dns-json', host: s.name },
+                timeout: 8000,
+            }, (r) => {
+                let d = '';
+                r.on('data', c => d += c);
+                r.on('end', () => {
+                    try {
+                        const j = JSON.parse(d);
+                        const ans = (j.Answer || []);
+                        const a = ans.find(x => x.type === 1);
+                        if (a) return resolve(a.data);
+                        const cn = ans.find(x => x.type === 5);
+                        if (cn) return dohResolve(cn.data.replace(/\.$/, '')).then(resolve, reject);
+                        tryNext();
+                    } catch (e) { tryNext(); }
+                });
+            });
+            req.on('error', tryNext);
+            req.on('timeout', () => { req.destroy(); tryNext(); });
+        };
+        tryNext();
+    });
+}
+
+async function resolveAny(hostname) {
+    try { return await dns.promises.lookup(hostname); }
+    catch (e) { const ip = await dohResolve(hostname); return { address: ip }; }
+}
+
 // ── Универсальный HTTPS-запрос через TLS ──
 function rawHttp(host, path, method, headers, body) {
     method = method || 'GET';
     headers = headers || [];
     return new Promise((resolve, reject) => {
-        dns.promises.lookup(host).then(({ address }) => {
+        resolveAny(host).then(({ address }) => {
             const sock = net.connect(443, address, () => {
                 const t = tls.connect({ socket: sock, servername: host }, () => {
                     let h = method + ' ' + path + ' HTTP/1.1\r\nHost: ' + host + '\r\nUser-Agent: relay\r\nConnection: close\r\n';
@@ -121,7 +166,7 @@ app.get('/tg/file', async (req, res) => {
 });
 
 // ── Мультипровайдер: GITHUB (основной) → GEMINI (запасной) ──
-app.get('/', (req, res) => res.send('Relay OK (GITHUB primary mode)'));
+app.get('/', (req, res) => res.send('Relay OK (GITHUB primary + DoH mode)'));
 app.get('/api/v1/models', (req, res) => {
     res.json({ data: [{ id: 'gpt-4o-mini' }, { id: 'gemini-3.8-flash' }] });
 });
@@ -227,4 +272,4 @@ wss.on('connection', (ws) => {
     ws.on('close', () => { if (upstream) upstream.destroy(); });
 });
 
-server.listen(3000, () => console.log('Relay ready (GITHUB primary, GEMINI fallback)'));
+server.listen(3000, () => console.log('Relay ready (GITHUB primary + DoH mode)'));
