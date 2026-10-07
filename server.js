@@ -164,13 +164,27 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-// ── Провайдеры: GROQ (qwen vision) → GEMINI (запасной) ──
-app.get('/', (req, res) => res.send('Relay OK (GROQ qwen-vision + DoH)'));
+// ── Провайдеры: GROQ (max 3 фото) → GEMINI (запасной) ──
+app.get('/', (req, res) => res.send('Relay OK (GROQ qwen3.8 + 3img limit)'));
 app.get('/api/v1/models', (req, res) => {
     res.json({ data: [{ id: 'qwen-vision' }, { id: 'gemini-3.8-flash' }] });
 });
 
 const GROQ_MODELS = [GROQ_MODEL, 'qwen/qwen3.8-27b'];
+
+function limitImages(oai, max) {
+    const o = JSON.parse(JSON.stringify(oai));
+    for (const m of (o.messages || [])) {
+        if (Array.isArray(m.content)) {
+            let n = 0;
+            m.content = m.content.filter(c => {
+                if (c.type === 'image_url') { n++; return n <= max; }
+                return true;
+            });
+        }
+    }
+    return o;
+}
 
 function sendGroq(oai, res, done) {
     if (!GROQ_KEY) return done(false, 401, Buffer.from('no GROQ_API_KEY'));
@@ -178,10 +192,11 @@ function sendGroq(oai, res, done) {
     const tryM = () => {
         if (mi >= GROQ_MODELS.length) return done(false, 404, Buffer.from('vision-модель Groq не найдена'));
         const model = GROQ_MODELS[mi++];
+        const limited = limitImages(oai, 3);
         const body = JSON.stringify({
             model: model,
             temperature: (oai.temperature != null ? oai.temperature : 0.2),
-            messages: oai.messages,
+            messages: limited.messages,
             max_tokens: 1500,
         });
         rawHttp(GROQ_HOST, '/openai/v1/chat/completions', 'POST',
@@ -286,4 +301,4 @@ wss.on('connection', (ws) => {
     ws.on('close', () => { if (upstream) upstream.destroy(); });
 });
 
-server.listen(3000, () => console.log('Relay ready (GROQ qwen-vision + DoH)'));
+server.listen(3000, () => console.log('Relay ready (GROQ qwen3.8 + 3img limit)'));
