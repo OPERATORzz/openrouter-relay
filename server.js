@@ -102,17 +102,16 @@ function rawHttp(host, path, method, headers, body) {
 }
 const httpGet = (host, path) => rawHttp(host, path);
 
-// ── Telegram intake (улучшенный: логин можно до фото, закрытие словом «готово») ──
+// ── Telegram intake ──
 let tgOffset = 0;
 let tgCurrentPhotos = [];
 let tgLots = [];
-let tgPendingCreds = {}; // chatId -> creds (если логин прислали ДО фото)
+let tgPendingCreds = {};
 
 function finishLot(chatId, creds) {
     if (!tgCurrentPhotos.length) return;
     tgLots.push({ id: Date.now() + '_' + Math.random().toString(36).slice(2, 7), chatId, creds, photos: tgCurrentPhotos });
     tgCurrentPhotos = [];
-    console.log('📲 TG: лот готов,', tgLots[tgLots.length - 1].photos.length, 'фото');
 }
 
 app.get('/tg/poll', async (req, res) => {
@@ -132,14 +131,12 @@ app.get('/tg/poll', async (req, res) => {
                 } else if (msg.text && !msg.text.startsWith('/')) {
                     const txt = msg.text.trim();
                     if (/^(готово|done)\b/i.test(txt)) {
-                        // «готово» или «готово: login:pass» — закрывает текущий лот
                         let creds = tgPendingCreds[chatId] || '';
-                        const m = txt.match(/^[гг]otovo|done\s*:?\s*(.+)$/i);
                         if (txt.includes(':')) creds = txt.replace(/^(готово|done)\s*:?\s*/i, '').trim();
                         if (creds) finishLot(chatId, creds);
                     } else if (txt.includes(':')) {
                         if (tgCurrentPhotos.length) finishLot(chatId, txt);
-                        else { tgPendingCreds[chatId] = txt; console.log('📲 TG: логин запомнен, жду фото'); }
+                        else tgPendingCreds[chatId] = txt;
                     }
                 }
             }
@@ -175,56 +172,92 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-// ── Провайдеры: GROQ (max 3 фото) → GEMINI ──
-app.get('/', (req, res) => res.send('Relay OK (GROQ qwen3.8 + TG improved)'));
+// ── Провайдеры: GROQ (фото пачками по 3 + склейка) → GEMINI ──
+app.get('/', (req, res) => res.send('Relay OK (GROQ chunked-vision)'));
 app.get('/api/v1/models', (req, res) => {
     res.json({ data: [{ id: 'qwen-vision' }, { id: 'gemini-3.8-flash' }] });
 });
 
 const GROQ_MODELS = [GROQ_MODEL, 'qwen/qwen3.8-27b'];
 
-function limitImages(oai, max) {
-    const o = JSON.parse(JSON.stringify(oai));
-    for (const m of (o.messages || [])) {
+function extractImages(oai) {
+    const imgs = [];
+    for (const m of (oai.messages || [])) {
         if (Array.isArray(m.content)) {
-            let n = 0;
-            m.content = m.content.filter(c => {
-                if (c.type === 'image_url') { n++; return n <= max; }
-                return true;
-            });
+            for (const c of m.content) if (c.type === 'image_url') imgs.push(c);
+        }
+    }
+    return imgs;
+}
+
+function replaceImages(oai, imgs) {
+    const o = JSON.parse(JSON.stringify(oai));
+    for (const m of o.messages) {
+        if (Array.isArray(m.content)) {
+            const texts = m.content.filter(c => c.type === 'text');
+            m.content = [...texts, ...imgs];
+            return o;
         }
     }
     return o;
 }
 
+function mergeResults(results) {
+    const tops = [], prems = [];
+    let silver = null, gold = null;
+    for (const r of results) {
+        for (const t of (r.топы || [])) { const s = String(t).trim(); if (s && !tops.includes(s)) tops.push(s); }
+        for (const p of (r.премы || [])) { const s = String(p).trim(); if (s && !prems.includes(s)) prems.push(s); }
+        if (r.серебро) silver = r.серебро;
+        if (r.золото) gold = r.золото;
+    }
+    return { 'топы': tops, 'премы': prems, 'серебро': silver, 'золото': gold };
+}
+
 function sendGroq(oai, res, done) {
     if (!GROQ_KEY) return done(false, 401, Buffer.from('no GROQ_API_KEY'));
-    let mi = 0;
-    const tryM = () => {
-        if (mi >= GROQ_MODELS.length) return done(false, 404, Buffer.from('vision-модель Groq не найдена'));
-        const model = GROQ_MODELS[mi++];
-        const limited = limitImages(oai, 3);
+    const imgs = extractImages(oai);
+    const chunks = [];
+    for (let i = 0; i < imgs.length; i += 3) chunks.push(imgs.slice(i, i + 3));
+    if (!chunks.length) chunks.push([]);
+    const results = [];
+    let modelIdx = 0;
+    const tryChunk = (ci) => {
+        if (ci >= chunks.length) {
+            const merged = mergeResults(results);
+            console.log('<- GROQ OK: пачек', chunks.length, '| топов', merged.топы.length, '| премов', merged.премы.length);
+            const oaiResp = JSON.stringify({ choices: [{ message: { role: 'assistant', content: JSON.stringify(merged) }, index: 0 }], model: 'qwen-chunked' });
+            return done(true, 200, Buffer.from(oaiResp));
+        }
+        const model = GROQ_MODELS[Math.min(modelIdx, GROQ_MODELS.length - 1)];
+        const sub = replaceImages(oai, chunks[ci]);
         const body = JSON.stringify({
             model: model,
             temperature: (oai.temperature != null ? oai.temperature : 0.2),
-            messages: limited.messages,
+            messages: sub.messages,
             max_tokens: 1500,
         });
         rawHttp(GROQ_HOST, '/openai/v1/chat/completions', 'POST',
             [['Content-Type', 'application/json'], ['Authorization', 'Bearer ' + GROQ_KEY]], body)
             .then(r => {
                 if (r.status === 404 && r.body.toString().includes('model_not_found')) {
-                    console.log('<- GROQ: модель', model, 'не найдена, пробую следующую');
-                    return tryM();
+                    modelIdx++;
+                    if (modelIdx < GROQ_MODELS.length) return tryChunk(ci);
+                    return done(false, 404, r.body);
                 }
                 if (r.status !== 200) return done(false, r.status, r.body);
-                if (!r.body.toString().includes('"choices"')) return done(false, 502, Buffer.from('bad body'));
-                console.log('<- GROQ OK, модель:', model);
-                done(true, 200, r.body);
+                try {
+                    const j = JSON.parse(r.body.toString());
+                    let text = j.choices[0].message.content;
+                    if (Array.isArray(text)) text = (text.find(p => p.type === 'text') || {}).text || '';
+                    const m = String(text).match(/\{[\s\S]*\}/);
+                    if (m) results.push(JSON.parse(m[0]));
+                } catch (e) { console.log('<- GROQ: пачка', ci, 'вернула мусор, пропускаю'); }
+                tryChunk(ci + 1);
             })
             .catch(e => done(false, 502, Buffer.from('conn: ' + e.message)));
     };
-    tryM();
+    tryChunk(0);
 }
 
 function sendGemini(oai, res, done) {
@@ -264,7 +297,7 @@ function sendGemini(oai, res, done) {
 
 app.post('/api/v1/chat/completions', (req, res) => {
     const oai = req.body;
-    console.log('-> запрос | фото:', Array.isArray(oai.messages?.[1]?.content) ? oai.messages[1].content.filter(c => c.type === 'image_url').length : 0);
+    console.log('-> запрос | фото:', extractImages(oai).length);
     const providers = [sendGroq, sendGemini];
     let pi = 0;
     const tryNext = () => {
@@ -275,11 +308,11 @@ app.post('/api/v1/chat/completions', (req, res) => {
         const p = providers[pi++];
         p(oai, res, (ok, status, payload) => {
             if (ok) {
-                console.log('<- ПРОВАЙДЕР', pi === 1 ? 'GROQ' : 'GEMINI', 'OK, ответ:', payload.length, 'байт');
+                console.log('<- ПРОВАЙДЕР', pi === 1 ? 'GROQ' : 'GEMINI', '| ответ:', payload.length, 'байт');
                 return res.status(200).type('application/json').send(payload);
             }
             if (status === 429 || status === 503 || status === 401 || status === 402) {
-                console.log('<- провайдер', pi, 'вернул', status, '→ пробую следующего');
+                console.log('<- провайдер', pi, 'вернул', status, '→ следующий');
                 return tryNext();
             }
             res.status(status).type('application/json').send(payload);
@@ -312,4 +345,4 @@ wss.on('connection', (ws) => {
     ws.on('close', () => { if (upstream) upstream.destroy(); });
 });
 
-server.listen(3000, () => console.log('Relay ready (GROQ + TG improved)'));
+server.listen(3000, () => console.log('Relay ready (GROQ chunked-vision)'));
