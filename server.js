@@ -16,7 +16,6 @@ const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const GEMINI_HOST = 'generativelanguage.googleapis.com';
 const GROQ_HOST = 'api.groq.com';
 
-// ── DNS: системный → DoH ──
 function dohResolve(hostname) {
     return new Promise((resolve, reject) => {
         const servers = [
@@ -103,15 +102,17 @@ function rawHttp(host, path, method, headers, body) {
 }
 const httpGet = (host, path) => rawHttp(host, path);
 
-// ── Telegram intake ──
+// ── Telegram intake (улучшенный: логин можно до фото, закрытие словом «готово») ──
 let tgOffset = 0;
 let tgCurrentPhotos = [];
 let tgLots = [];
+let tgPendingCreds = {}; // chatId -> creds (если логин прислали ДО фото)
 
 function finishLot(chatId, creds) {
     if (!tgCurrentPhotos.length) return;
     tgLots.push({ id: Date.now() + '_' + Math.random().toString(36).slice(2, 7), chatId, creds, photos: tgCurrentPhotos });
     tgCurrentPhotos = [];
+    console.log('📲 TG: лот готов,', tgLots[tgLots.length - 1].photos.length, 'фото');
 }
 
 app.get('/tg/poll', async (req, res) => {
@@ -128,8 +129,18 @@ app.get('/tg/poll', async (req, res) => {
                 if (msg.photo && msg.photo.length) {
                     tgCurrentPhotos.push(msg.photo[msg.photo.length - 1].file_id);
                     if (msg.caption && msg.caption.includes(':')) finishLot(chatId, msg.caption.trim());
-                } else if (msg.text && msg.text.includes(':') && !msg.text.startsWith('/')) {
-                    finishLot(chatId, msg.text.trim());
+                } else if (msg.text && !msg.text.startsWith('/')) {
+                    const txt = msg.text.trim();
+                    if (/^(готово|done)\b/i.test(txt)) {
+                        // «готово» или «готово: login:pass» — закрывает текущий лот
+                        let creds = tgPendingCreds[chatId] || '';
+                        const m = txt.match(/^[гг]otovo|done\s*:?\s*(.+)$/i);
+                        if (txt.includes(':')) creds = txt.replace(/^(готово|done)\s*:?\s*/i, '').trim();
+                        if (creds) finishLot(chatId, creds);
+                    } else if (txt.includes(':')) {
+                        if (tgCurrentPhotos.length) finishLot(chatId, txt);
+                        else { tgPendingCreds[chatId] = txt; console.log('📲 TG: логин запомнен, жду фото'); }
+                    }
                 }
             }
         }
@@ -164,8 +175,8 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-// ── Провайдеры: GROQ (max 3 фото) → GEMINI (запасной) ──
-app.get('/', (req, res) => res.send('Relay OK (GROQ qwen3.8 + 3img limit)'));
+// ── Провайдеры: GROQ (max 3 фото) → GEMINI ──
+app.get('/', (req, res) => res.send('Relay OK (GROQ qwen3.8 + TG improved)'));
 app.get('/api/v1/models', (req, res) => {
     res.json({ data: [{ id: 'qwen-vision' }, { id: 'gemini-3.8-flash' }] });
 });
@@ -301,4 +312,4 @@ wss.on('connection', (ws) => {
     ws.on('close', () => { if (upstream) upstream.destroy(); });
 });
 
-server.listen(3000, () => console.log('Relay ready (GROQ qwen3.8 + 3img limit)'));
+server.listen(3000, () => console.log('Relay ready (GROQ + TG improved)'));
