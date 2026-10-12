@@ -9,11 +9,9 @@ const dns = require('dns');
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 
-const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 const GROQ_KEY = process.env.GROQ_API_KEY || '';
 const GROQ_MODEL = process.env.GROQ_MODEL || 'qwen/qwen3.8-27b';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
-const GEMINI_HOST = 'generativelanguage.googleapis.com';
 const GROQ_HOST = 'api.groq.com';
 
 function dohResolve(hostname) {
@@ -172,10 +170,10 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-// ── Провайдеры: GROQ (фото пачками по 3 + склейка) → GEMINI ──
-app.get('/', (req, res) => res.send('Relay OK (GROQ chunked-vision)'));
+// ── GROQ: фото пачками по 3 + автоповтор при 429 ──
+app.get('/', (req, res) => res.send('Relay OK (GROQ 429-retry)'));
 app.get('/api/v1/models', (req, res) => {
-    res.json({ data: [{ id: 'qwen-vision' }, { id: 'gemini-3.8-flash' }] });
+    res.json({ data: [{ id: 'qwen-vision' }] });
 });
 
 const GROQ_MODELS = [GROQ_MODEL, 'qwen/qwen3.8-27b'];
@@ -222,7 +220,11 @@ function sendGroq(oai, res, done) {
     if (!chunks.length) chunks.push([]);
     const results = [];
     let modelIdx = 0;
-    const tryChunk = (ci) => {
+    const post = (body) => rawHttp(GROQ_HOST, '/openai/v1/chat/completions', 'POST',
+        [['Content-Type', 'application/json'], ['Authorization', 'Bearer ' + GROQ_KEY]], body);
+
+    const tryChunk = (ci, attempt) => {
+        attempt = attempt || 0;
         if (ci >= chunks.length) {
             const merged = mergeResults(results);
             console.log('<- GROQ OK: пачек', chunks.length, '| топов', merged.топы.length, '| премов', merged.премы.length);
@@ -237,88 +239,46 @@ function sendGroq(oai, res, done) {
             messages: sub.messages,
             max_tokens: 1500,
         });
-        rawHttp(GROQ_HOST, '/openai/v1/chat/completions', 'POST',
-            [['Content-Type', 'application/json'], ['Authorization', 'Bearer ' + GROQ_KEY]], body)
-            .then(r => {
-                if (r.status === 404 && r.body.toString().includes('model_not_found')) {
-                    modelIdx++;
-                    if (modelIdx < GROQ_MODELS.length) return tryChunk(ci);
-                    return done(false, 404, r.body);
+        post(body).then(r => {
+            if (r.status === 429) {
+                if (attempt < 3) {
+                    console.log('<- GROQ 429 (пачка', ci + 1, ') — жду 20 сек, попытка', attempt + 1, '/3');
+                    return setTimeout(() => tryChunk(ci, attempt + 1), 20000);
                 }
-                if (r.status !== 200) return done(false, r.status, r.body);
-                try {
-                    const j = JSON.parse(r.body.toString());
-                    let text = j.choices[0].message.content;
-                    if (Array.isArray(text)) text = (text.find(p => p.type === 'text') || {}).text || '';
-                    const m = String(text).match(/\{[\s\S]*\}/);
-                    if (m) results.push(JSON.parse(m[0]));
-                } catch (e) { console.log('<- GROQ: пачка', ci, 'вернула мусор, пропускаю'); }
-                tryChunk(ci + 1);
-            })
-            .catch(e => done(false, 502, Buffer.from('conn: ' + e.message)));
-    };
-    tryChunk(0);
-}
-
-function sendGemini(oai, res, done) {
-    if (!GEMINI_KEY) return done(false, 401, Buffer.from('no GEMINI_API_KEY'));
-    let model = String(oai.model || 'gemini-3.8-flash').replace(':free', '');
-    if (!model.startsWith('gemini')) model = 'gemini-3.8-flash';
-    const parts = [];
-    for (const m of (oai.messages || [])) {
-        if (typeof m.content === 'string') parts.push({ text: m.content });
-        else if (Array.isArray(m.content)) {
-            for (const c of m.content) {
-                if (c.type === 'text') parts.push({ text: c.text });
-                else if (c.type === 'image_url') {
-                    const url = (c.image_url && c.image_url.url) || '';
-                    const b64 = url.includes(',') ? url.split(',').pop() : url;
-                    parts.push({ inline_data: { mime_type: 'image/jpeg', data: b64 } });
-                }
+                return done(false, 429, r.body);
             }
-        }
-    }
-    const body = JSON.stringify({
-        contents: [{ role: 'user', parts }],
-        generationConfig: { temperature: (oai.temperature != null ? oai.temperature : 0.2) },
-    });
-    const path = '/v1beta/models/' + model + ':generateContent?key=' + GEMINI_KEY;
-    rawHttp(GEMINI_HOST, path, 'POST', [['Content-Type', 'application/json']], body).then(r => {
-        if (r.status !== 200) return done(false, r.status, r.body);
-        try {
-            const g = JSON.parse(r.body.toString());
-            if (!g.candidates || !g.candidates[0]) return done(false, 502, Buffer.from('no candidates'));
-            const text = g.candidates[0].content.parts.map(p => p.text || '').join('');
-            const oaiResp = JSON.stringify({ choices: [{ message: { role: 'assistant', content: text }, index: 0 }], model: model });
-            done(true, 200, Buffer.from(oaiResp));
-        } catch (e) { done(false, 502, Buffer.from('parse: ' + e.message)); }
-    }).catch(e => done(false, 502, Buffer.from('conn: ' + e.message)));
+            if (r.status === 404 && r.body.toString().includes('model_not_found')) {
+                modelIdx++;
+                if (modelIdx < GROQ_MODELS.length) return tryChunk(ci, 0);
+                return done(false, 404, r.body);
+            }
+            if (r.status !== 200) return done(false, r.status, r.body);
+            try {
+                const j = JSON.parse(r.body.toString());
+                let text = j.choices[0].message.content;
+                if (Array.isArray(text)) text = (text.find(p => p.type === 'text') || {}).text || '';
+                const m = String(text).match(/\{[\s\S]*\}/);
+                if (m) results.push(JSON.parse(m[0]));
+            } catch (e) { console.log('<- GROQ: пачка', ci + 1, 'мусор, пропускаю'); }
+            tryChunk(ci + 1, 0);
+        }).catch(e => {
+            if (attempt < 2) {
+                console.log('<- GROQ сеть (', e.message, ') — повтор через 10 сек');
+                return setTimeout(() => tryChunk(ci, attempt + 1), 10000);
+            }
+            done(false, 502, Buffer.from('conn: ' + e.message));
+        });
+    };
+    tryChunk(0, 0);
 }
 
 app.post('/api/v1/chat/completions', (req, res) => {
     const oai = req.body;
     console.log('-> запрос | фото:', extractImages(oai).length);
-    const providers = [sendGroq, sendGemini];
-    let pi = 0;
-    const tryNext = () => {
-        if (pi >= providers.length) {
-            return res.status(429).type('application/json')
-                .send(Buffer.from(JSON.stringify({ error: { message: 'оба провайдера исчерпаны' } })));
-        }
-        const p = providers[pi++];
-        p(oai, res, (ok, status, payload) => {
-            if (ok) {
-                console.log('<- ПРОВАЙДЕР', pi === 1 ? 'GROQ' : 'GEMINI', '| ответ:', payload.length, 'байт');
-                return res.status(200).type('application/json').send(payload);
-            }
-            if (status === 429 || status === 503 || status === 401 || status === 402) {
-                console.log('<- провайдер', pi, 'вернул', status, '→ следующий');
-                return tryNext();
-            }
-            res.status(status).type('application/json').send(payload);
-        });
-    };
-    tryNext();
+    sendGroq(oai, res, (ok, status, payload) => {
+        if (ok) return res.status(200).type('application/json').send(payload);
+        res.status(status).type('application/json').send(payload);
+    });
 });
 
 const server = http.createServer(app);
@@ -345,4 +305,4 @@ wss.on('connection', (ws) => {
     ws.on('close', () => { if (upstream) upstream.destroy(); });
 });
 
-server.listen(3000, () => console.log('Relay ready (GROQ chunked-vision)'));
+server.listen(3000, () => console.log('Relay ready (GROQ 429-retry mode)'));
