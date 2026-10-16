@@ -14,11 +14,10 @@ const GROQ_MODEL = process.env.GROQ_MODEL || 'qwen/qwen3.8-27b';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const GROQ_HOST = 'api.groq.com';
 
-// ── Настройки лимитов Groq ──
-const CHUNK_SIZE = 1;
-const MAX_TOKENS = 400;
-const PAUSE_BETWEEN_CHUNKS = 20000;
-const PAUSE_ON_429 = 90000;
+const CHUNK_SIZE = 2;
+const MAX_TOKENS = 600;
+const PAUSE_BETWEEN_CHUNKS = 15000;
+const PAUSE_ON_429 = 60000;
 const MAX_429_RETRIES = 6;
 
 function dohResolve(hostname) {
@@ -107,7 +106,6 @@ function rawHttp(host, path, method, headers, body) {
 }
 const httpGet = (host, path) => rawHttp(host, path);
 
-// ── Telegram intake ──
 let tgOffset = 0;
 let tgCurrentPhotos = [];
 let tgLots = [];
@@ -177,8 +175,7 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-// ── GROQ ──
-app.get('/', (req, res) => res.send('Relay OK (rate-safe v2)'));
+app.get('/', (req, res) => res.send('Relay OK (v9.3)'));
 app.get('/api/v1/models', (req, res) => {
     res.json({ data: [{ id: 'qwen-vision' }] });
 });
@@ -219,7 +216,6 @@ function mergeResults(results) {
     const topsMap = new Map();
     const premsMap = new Map();
     let silver = null, gold = null;
-
     const pushUnique = (map, name) => {
         const s = String(name).trim();
         if (!s) return;
@@ -228,14 +224,12 @@ function mergeResults(results) {
         if (!key) return;
         if (!map.has(key)) map.set(key, s);
     };
-
     for (const r of results) {
         for (const t of (r.топы || [])) pushUnique(topsMap, t);
         for (const p of (r.премы || [])) pushUnique(premsMap, p);
         if (r.серебро) silver = r.серебро;
         if (r.золото) gold = r.золото;
     }
-
     return {
         'топы': [...topsMap.values()],
         'премы': [...premsMap.values()],
@@ -304,13 +298,51 @@ function sendGroq(oai, res, done) {
                 console.log('<- GROQ пачка', ci + 1, 'OK');
             } catch (e) { console.log('<- GROQ: пачка', ci + 1, 'мусор, пропускаю'); }
             const nextDelay = (ci + 1 < chunks.length) ? PAUSE_BETWEEN_CHUNKS : 0;
-            if (nextDelay) {
-                console.log('   ...пауза', nextDelay / 1000, 'сек до следующей пачки');
-            }
+            if (nextDelay) console.log('   ...пауза', nextDelay / 1000, 'сек до следующей пачки');
             setTimeout(() => tryChunk(ci + 1, 0), nextDelay);
         }).catch(e => {
             if (attempt < 2) {
                 console.log('<- GROQ сеть (', e.message, ') — повтор через 10 сек');
                 return setTimeout(() => tryChunk(ci, attempt + 1), 10000);
             }
-            if (ci + 1 < chunks.length) return setTimeout(() => tryChunk
+            if (ci + 1 < chunks.length) return setTimeout(() => tryChunk(ci + 1, 0), PAUSE_BETWEEN_CHUNKS);
+            done(false, 502, Buffer.from('conn: ' + e.message));
+        });
+    };
+    tryChunk(0, 0);
+}
+
+app.post('/api/v1/chat/completions', (req, res) => {
+    const oai = req.body;
+    console.log('-> запрос | фото:', extractImages(oai).length);
+    sendGroq(oai, res, (ok, status, payload) => {
+        if (ok) return res.status(200).type('application/json').send(payload);
+        res.status(status).type('application/json').send(payload);
+    });
+});
+
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: '/ws' });
+wss.on('connection', (ws) => {
+    let upstream = null;
+    ws.on('message', (data) => {
+        if (!upstream) {
+            try {
+                const r = JSON.parse(data.toString());
+                const [host, port] = r.target.split(':');
+                const s = net.connect(parseInt(port), host, () => {
+                    upstream = tls.connect({ socket: s, servername: host }, () => upstream.write(r.data));
+                    upstream.on('data', d => { if (ws.readyState === 1) ws.send(d.toString('base64')); });
+                    upstream.on('end', () => ws.close());
+                    upstream.on('error', () => ws.close());
+                });
+                s.on('error', () => ws.close());
+            } catch (e) { ws.close(); }
+        } else {
+            upstream.write(Buffer.from(data.toString(), 'base64'));
+        }
+    });
+    ws.on('close', () => { if (upstream) upstream.destroy(); });
+});
+
+server.listen(3000, () => console.log('Relay ready v9.3 | CHUNK=' + CHUNK_SIZE + ' MAX_TOKENS=' + MAX_TOKENS + ' PAUSE=' + (PAUSE_BETWEEN_CHUNKS / 1000) + 's 429PAUSE=' + (PAUSE_ON_429 / 1000) + 's'));
