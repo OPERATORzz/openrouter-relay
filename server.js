@@ -170,8 +170,8 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-// ── GROQ: фото пачками по 3 + автоповтор при 429 ──
-app.get('/', (req, res) => res.send('Relay OK (GROQ 429-retry)'));
+// ── GROQ: пачки по 3 + умная склейка без дублей ──
+app.get('/', (req, res) => res.send('Relay OK (smart-merge)'));
 app.get('/api/v1/models', (req, res) => {
     res.json({ data: [{ id: 'qwen-vision' }] });
 });
@@ -200,16 +200,41 @@ function replaceImages(oai, imgs) {
     return o;
 }
 
+function normalizeTank(s) {
+    return String(s || '')
+        .toLowerCase()
+        .replace(/[\s\-_.]/g, '')
+        .replace(/[«»"'`]/g, '')
+        .trim();
+}
+
 function mergeResults(results) {
-    const tops = [], prems = [];
+    const topsMap = new Map();
+    const premsMap = new Map();
     let silver = null, gold = null;
+
+    const pushUnique = (map, name) => {
+        const s = String(name).trim();
+        if (!s) return;
+        if (s.length < 3 || s.length > 60) return;
+        const key = normalizeTank(s);
+        if (!key) return;
+        if (!map.has(key)) map.set(key, s);
+    };
+
     for (const r of results) {
-        for (const t of (r.топы || [])) { const s = String(t).trim(); if (s && !tops.includes(s)) tops.push(s); }
-        for (const p of (r.премы || [])) { const s = String(p).trim(); if (s && !prems.includes(s)) prems.push(s); }
+        for (const t of (r.топы || [])) pushUnique(topsMap, t);
+        for (const p of (r.премы || [])) pushUnique(premsMap, p);
         if (r.серебро) silver = r.серебро;
         if (r.золото) gold = r.золото;
     }
-    return { 'топы': tops, 'премы': prems, 'серебро': silver, 'золото': gold };
+
+    return {
+        'топы': [...topsMap.values()],
+        'премы': [...premsMap.values()],
+        'серебро': silver,
+        'золото': gold
+    };
 }
 
 function sendGroq(oai, res, done) {
@@ -305,4 +330,4 @@ wss.on('connection', (ws) => {
     ws.on('close', () => { if (upstream) upstream.destroy(); });
 });
 
-server.listen(3000, () => console.log('Relay ready (GROQ 429-retry mode)'));
+server.listen(3000, () => console.log('Relay ready (smart-merge mode)'));
