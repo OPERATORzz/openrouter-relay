@@ -14,12 +14,12 @@ const GROQ_MODEL = process.env.GROQ_MODEL || 'qwen/qwen3.8-27b';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const GROQ_HOST = 'api.groq.com';
 
-// ── Настройки лимитов Groq (free tier 1000 OTPM) ──
-const CHUNK_SIZE = 2;          // фото в пачке (было 3 → 2)
-const MAX_TOKENS = 600;        // максимум токенов на ответ (было 1500 → 600)
-const PAUSE_BETWEEN_CHUNKS = 15000;  // пауза между пачками (мс)
-const PAUSE_ON_429 = 60000;    // пауза при 429 (мс) — полное обнуление лимита
-const MAX_429_RETRIES = 5;     // попыток при 429
+// ── Настройки лимитов Groq ──
+const CHUNK_SIZE = 1;
+const MAX_TOKENS = 400;
+const PAUSE_BETWEEN_CHUNKS = 20000;
+const PAUSE_ON_429 = 90000;
+const MAX_429_RETRIES = 6;
 
 function dohResolve(hostname) {
     return new Promise((resolve, reject) => {
@@ -178,7 +178,7 @@ app.get('/tg/file', async (req, res) => {
 });
 
 // ── GROQ ──
-app.get('/', (req, res) => res.send('Relay OK (smart-merge + rate-limit-safe)'));
+app.get('/', (req, res) => res.send('Relay OK (rate-safe v2)'));
 app.get('/api/v1/models', (req, res) => {
     res.json({ data: [{ id: 'qwen-vision' }] });
 });
@@ -313,44 +313,4 @@ function sendGroq(oai, res, done) {
                 console.log('<- GROQ сеть (', e.message, ') — повтор через 10 сек');
                 return setTimeout(() => tryChunk(ci, attempt + 1), 10000);
             }
-            if (ci + 1 < chunks.length) return setTimeout(() => tryChunk(ci + 1, 0), PAUSE_BETWEEN_CHUNKS);
-            done(false, 502, Buffer.from('conn: ' + e.message));
-        });
-    };
-    tryChunk(0, 0);
-}
-
-app.post('/api/v1/chat/completions', (req, res) => {
-    const oai = req.body;
-    console.log('-> запрос | фото:', extractImages(oai).length);
-    sendGroq(oai, res, (ok, status, payload) => {
-        if (ok) return res.status(200).type('application/json').send(payload);
-        res.status(status).type('application/json').send(payload);
-    });
-});
-
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/ws' });
-wss.on('connection', (ws) => {
-    let upstream = null;
-    ws.on('message', (data) => {
-        if (!upstream) {
-            try {
-                const r = JSON.parse(data.toString());
-                const [host, port] = r.target.split(':');
-                const s = net.connect(parseInt(port), host, () => {
-                    upstream = tls.connect({ socket: s, servername: host }, () => upstream.write(r.data));
-                    upstream.on('data', d => { if (ws.readyState === 1) ws.send(d.toString('base64')); });
-                    upstream.on('end', () => ws.close());
-                    upstream.on('error', () => ws.close());
-                });
-                s.on('error', () => ws.close());
-            } catch (e) { ws.close(); }
-        } else {
-            upstream.write(Buffer.from(data.toString(), 'base64'));
-        }
-    });
-    ws.on('close', () => { if (upstream) upstream.destroy(); });
-});
-
-server.listen(3000, () => console.log('Relay ready (smart-merge + rate-limit-safe) | CHUNK=' + CHUNK_SIZE + ' MAX_TOKENS=' + MAX_TOKENS + ' PAUSE=' + (PAUSE_BETWEEN_CHUNKS / 1000) + 's 429PAUSE=' + (PAUSE_ON_429 / 1000) + 's'));
+            if (ci + 1 < chunks.length) return setTimeout(() => tryChunk
