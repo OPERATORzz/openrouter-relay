@@ -14,6 +14,13 @@ const GROQ_MODEL = process.env.GROQ_MODEL || 'qwen/qwen3.8-27b';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const GROQ_HOST = 'api.groq.com';
 
+// ── Настройки лимитов Groq (free tier 1000 OTPM) ──
+const CHUNK_SIZE = 2;          // фото в пачке (было 3 → 2)
+const MAX_TOKENS = 600;        // максимум токенов на ответ (было 1500 → 600)
+const PAUSE_BETWEEN_CHUNKS = 15000;  // пауза между пачками (мс)
+const PAUSE_ON_429 = 60000;    // пауза при 429 (мс) — полное обнуление лимита
+const MAX_429_RETRIES = 5;     // попыток при 429
+
 function dohResolve(hostname) {
     return new Promise((resolve, reject) => {
         const servers = [
@@ -170,8 +177,8 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-// ── GROQ: пачки по 3 + умная склейка без дублей ──
-app.get('/', (req, res) => res.send('Relay OK (smart-merge)'));
+// ── GROQ ──
+app.get('/', (req, res) => res.send('Relay OK (smart-merge + rate-limit-safe)'));
 app.get('/api/v1/models', (req, res) => {
     res.json({ data: [{ id: 'qwen-vision' }] });
 });
@@ -241,10 +248,11 @@ function sendGroq(oai, res, done) {
     if (!GROQ_KEY) return done(false, 401, Buffer.from('no GROQ_API_KEY'));
     const imgs = extractImages(oai);
     const chunks = [];
-    for (let i = 0; i < imgs.length; i += 3) chunks.push(imgs.slice(i, i + 3));
+    for (let i = 0; i < imgs.length; i += CHUNK_SIZE) chunks.push(imgs.slice(i, i + CHUNK_SIZE));
     if (!chunks.length) chunks.push([]);
     const results = [];
     let modelIdx = 0;
+    const t0 = Date.now();
     const post = (body) => rawHttp(GROQ_HOST, '/openai/v1/chat/completions', 'POST',
         [['Content-Type', 'application/json'], ['Authorization', 'Bearer ' + GROQ_KEY]], body);
 
@@ -252,7 +260,8 @@ function sendGroq(oai, res, done) {
         attempt = attempt || 0;
         if (ci >= chunks.length) {
             const merged = mergeResults(results);
-            console.log('<- GROQ OK: пачек', chunks.length, '| топов', merged.топы.length, '| премов', merged.премы.length);
+            const dt = ((Date.now() - t0) / 1000).toFixed(1);
+            console.log('<- GROQ OK: пачек', chunks.length, '| топов', merged.топы.length, '| премов', merged.премы.length, '| за', dt, 'с');
             const oaiResp = JSON.stringify({ choices: [{ message: { role: 'assistant', content: JSON.stringify(merged) }, index: 0 }], model: 'qwen-chunked' });
             return done(true, 200, Buffer.from(oaiResp));
         }
@@ -262,35 +271,49 @@ function sendGroq(oai, res, done) {
             model: model,
             temperature: (oai.temperature != null ? oai.temperature : 0.2),
             messages: sub.messages,
-            max_tokens: 1500,
+            max_tokens: MAX_TOKENS,
         });
+        console.log('-> GROQ пачка', ci + 1, '/', chunks.length, '| фото:', chunks[ci].length, '| попытка', attempt + 1);
         post(body).then(r => {
             if (r.status === 429) {
-                if (attempt < 3) {
-                    console.log('<- GROQ 429 (пачка', ci + 1, ') — жду 20 сек, попытка', attempt + 1, '/3');
-                    return setTimeout(() => tryChunk(ci, attempt + 1), 20000);
+                if (attempt < MAX_429_RETRIES) {
+                    console.log('<- GROQ 429 (пачка', ci + 1, ') — жду', PAUSE_ON_429 / 1000, 'сек, попытка', attempt + 1, '/', MAX_429_RETRIES);
+                    return setTimeout(() => tryChunk(ci, attempt + 1), PAUSE_ON_429);
                 }
-                return done(false, 429, r.body);
+                console.log('<- GROQ 429 — сдаюсь на пачке', ci + 1, '— пропускаю её');
+                return tryChunk(ci + 1, 0);
             }
             if (r.status === 404 && r.body.toString().includes('model_not_found')) {
                 modelIdx++;
                 if (modelIdx < GROQ_MODELS.length) return tryChunk(ci, 0);
                 return done(false, 404, r.body);
             }
-            if (r.status !== 200) return done(false, r.status, r.body);
+            if (r.status !== 200) {
+                console.log('<- GROQ ошибка', r.status, 'на пачке', ci + 1, '— пропускаю её');
+                if (ci + 1 < chunks.length) {
+                    return setTimeout(() => tryChunk(ci + 1, 0), PAUSE_BETWEEN_CHUNKS);
+                }
+                return done(false, r.status, r.body);
+            }
             try {
                 const j = JSON.parse(r.body.toString());
                 let text = j.choices[0].message.content;
                 if (Array.isArray(text)) text = (text.find(p => p.type === 'text') || {}).text || '';
                 const m = String(text).match(/\{[\s\S]*\}/);
                 if (m) results.push(JSON.parse(m[0]));
+                console.log('<- GROQ пачка', ci + 1, 'OK');
             } catch (e) { console.log('<- GROQ: пачка', ci + 1, 'мусор, пропускаю'); }
-            tryChunk(ci + 1, 0);
+            const nextDelay = (ci + 1 < chunks.length) ? PAUSE_BETWEEN_CHUNKS : 0;
+            if (nextDelay) {
+                console.log('   ...пауза', nextDelay / 1000, 'сек до следующей пачки');
+            }
+            setTimeout(() => tryChunk(ci + 1, 0), nextDelay);
         }).catch(e => {
             if (attempt < 2) {
                 console.log('<- GROQ сеть (', e.message, ') — повтор через 10 сек');
                 return setTimeout(() => tryChunk(ci, attempt + 1), 10000);
             }
+            if (ci + 1 < chunks.length) return setTimeout(() => tryChunk(ci + 1, 0), PAUSE_BETWEEN_CHUNKS);
             done(false, 502, Buffer.from('conn: ' + e.message));
         });
     };
@@ -330,4 +353,4 @@ wss.on('connection', (ws) => {
     ws.on('close', () => { if (upstream) upstream.destroy(); });
 });
 
-server.listen(3000, () => console.log('Relay ready (smart-merge mode)'));
+server.listen(3000, () => console.log('Relay ready (smart-merge + rate-limit-safe) | CHUNK=' + CHUNK_SIZE + ' MAX_TOKENS=' + MAX_TOKENS + ' PAUSE=' + (PAUSE_BETWEEN_CHUNKS / 1000) + 's 429PAUSE=' + (PAUSE_ON_429 / 1000) + 's'));
