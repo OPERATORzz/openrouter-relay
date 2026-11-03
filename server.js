@@ -14,12 +14,12 @@ const GROQ_MODEL = process.env.GROQ_MODEL || 'qwen/qwen3.8-27b';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const GROQ_HOST = 'api.groq.com';
 
-// 🚨 САМЫЕ БЕЗОПАСНЫЕ НАСТРОЙКИ ДЛЯ БЕСПЛАТНОГО GROQ
+// БЕЗОПАСНЫЙ РЕЖИМ (чтобы не ловить 429 ошибку)
 const CHUNK_SIZE = 1; 
 const MAX_TOKENS = 600;
 const PAUSE_BETWEEN_CHUNKS = 30000; // 30 секунд между фото
-const PAUSE_ON_429 = 120000; // 2 минуты, если словим лимит
-const MAX_429_RETRIES = 10; // много попыток
+const PAUSE_ON_429 = 120000; // 2 минуты, если лимит
+const MAX_429_RETRIES = 10; 
 
 function dohResolve(hostname) {
     return new Promise((resolve, reject) => {
