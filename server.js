@@ -9,17 +9,21 @@ const dns = require('dns');
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 
-const GROQ_KEY = process.env.GROQ_API_KEY || '';
+// 🚨 ЧИТАЕМ НЕСКОЛЬКО КЛЮЧЕЙ ЧЕРЕЗ ЗАПЯТУЮ
+const rawKeys = process.env.GROQ_API_KEY || '';
+const GROQ_KEYS = rawKeys.split(',').map(k => k.trim()).filter(Boolean);
 const GROQ_MODEL = process.env.GROQ_MODEL || 'qwen/qwen3.8-27b';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const GROQ_HOST = 'api.groq.com';
 
-// БЕЗОПАСНЫЙ РЕЖИМ (чтобы не ловить 429 ошибку)
+// 🚀 УСКОРЕННЫЕ НАСТРОЙКИ (чередуем ключи, пауза 2 сек)
 const CHUNK_SIZE = 1; 
 const MAX_TOKENS = 600;
-const PAUSE_BETWEEN_CHUNKS = 30000; // 30 секунд между фото
-const PAUSE_ON_429 = 120000; // 2 минуты, если лимит
+const PAUSE_BETWEEN_CHUNKS = 2000; // Всего 2 секунды! (вместо 30)
+const PAUSE_ON_429 = 60000; // 1 минута, если оба ключа забанились
 const MAX_429_RETRIES = 10; 
+
+let keyOffset = 0; // Для чередования ключей
 
 function dohResolve(hostname) {
     return new Promise((resolve, reject) => {
@@ -142,7 +146,7 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-app.get('/', (req, res) => res.send('Relay OK (safe-mode)'));
+app.get('/', (req, res) => res.send('Relay OK (fast multi-key)'));
 app.get('/api/v1/models', (req, res) => res.json({ data: [{ id: 'qwen-vision' }] }));
 
 const GROQ_MODELS = [GROQ_MODEL, 'qwen/qwen3.8-27b'];
@@ -169,12 +173,12 @@ function mergeResults(results) {
 }
 
 function sendGroq(oai, res, done) {
-    if (!GROQ_KEY) return done(false, 401, Buffer.from('no GROQ_API_KEY'));
+    if (!GROQ_KEYS.length) return done(false, 401, Buffer.from('no GROQ_API_KEY'));
     const imgs = extractImages(oai);
     const chunks = []; for (let i = 0; i < imgs.length; i += CHUNK_SIZE) chunks.push(imgs.slice(i, i + CHUNK_SIZE));
     if (!chunks.length) chunks.push([]);
     const results = []; let modelIdx = 0; const t0 = Date.now();
-    const post = (body) => rawHttp(GROQ_HOST, '/openai/v1/chat/completions', 'POST', [['Content-Type', 'application/json'], ['Authorization', 'Bearer ' + GROQ_KEY]], body);
+    
     const tryChunk = (ci, attempt) => {
         attempt = attempt || 0;
         if (ci >= chunks.length) {
@@ -184,18 +188,26 @@ function sendGroq(oai, res, done) {
             const oaiResp = JSON.stringify({ choices: [{ message: { role: 'assistant', content: JSON.stringify(merged) }, index: 0 }], model: 'qwen-chunked' });
             return done(true, 200, Buffer.from(oaiResp));
         }
+        
         const model = GROQ_MODELS[Math.min(modelIdx, GROQ_MODELS.length - 1)];
         const sub = replaceImages(oai, chunks[ci]);
+        
+        // 🚀 ЧЕРЕДУЕМ КЛЮЧИ НА КАЖДОЕ ФОТО
+        const currentKey = GROQ_KEYS[(ci + attempt) % GROQ_KEYS.length];
+        const keyMasked = currentKey.substring(0, 8) + '...' + currentKey.slice(-4);
+        
         const body = JSON.stringify({ model: model, temperature: (oai.temperature != null ? oai.temperature : 0.2), messages: sub.messages, max_tokens: MAX_TOKENS });
-        console.log('-> GROQ пачка', ci + 1, '/', chunks.length, '| фото:', chunks[ci].length, '| попытка', attempt + 1);
-        post(body).then(r => {
+        console.log('-> GROQ пачка', ci + 1, '/', chunks.length, '| фото:', chunks[ci].length, '| попытка', attempt + 1, '| Ключ:', keyMasked);
+        
+        rawHttp(GROQ_HOST, '/openai/v1/chat/completions', 'POST', [['Content-Type', 'application/json'], ['Authorization', 'Bearer ' + currentKey]], body).then(r => {
             if (r.status === 429) {
-                if (attempt < MAX_429_RETRIES) {
-                    console.log('<- GROQ 429 (пачка', ci + 1, ') — жду', PAUSE_ON_429 / 1000, 'сек, попытка', attempt + 1, '/', MAX_429_RETRIES);
-                    return setTimeout(() => tryChunk(ci, attempt + 1), PAUSE_ON_429);
+                // Если ключ забанился, берем следующий
+                if (attempt >= (GROQ_KEYS.length * 2)) {
+                    console.log('<- GROQ 429 на ВСЕХ ключах. Жду', PAUSE_ON_429 / 1000, 'сек...');
+                    return setTimeout(() => tryChunk(ci, 0), PAUSE_ON_429);
                 }
-                console.log('<- GROQ 429 — сдаюсь на пачке', ci + 1, '— пропускаю её');
-                return tryChunk(ci + 1, 0);
+                console.log('<- GROQ 429. Переключаюсь на следующий ключ...');
+                return setTimeout(() => tryChunk(ci, attempt + 1), 2000);
             }
             if (r.status === 404 && r.body.toString().includes('model_not_found')) {
                 modelIdx++;
@@ -207,6 +219,9 @@ function sendGroq(oai, res, done) {
                 if (ci + 1 < chunks.length) return setTimeout(() => tryChunk(ci + 1, 0), PAUSE_BETWEEN_CHUNKS);
                 return done(false, r.status, r.body);
             }
+            
+            // УСПЕХ!
+            attempt = 0; 
             try {
                 const j = JSON.parse(r.body.toString());
                 let text = j.choices[0].message.content;
@@ -215,13 +230,15 @@ function sendGroq(oai, res, done) {
                 if (m) results.push(JSON.parse(m[0]));
                 console.log('<- GROQ пачка', ci + 1, 'OK');
             } catch (e) { console.log('<- GROQ: пачка', ci + 1, 'мусор, пропускаю'); }
+            
             const nextDelay = (ci + 1 < chunks.length) ? PAUSE_BETWEEN_CHUNKS : 0;
             if (nextDelay) console.log('   ...пауза', nextDelay / 1000, 'сек до следующей пачки');
             setTimeout(() => tryChunk(ci + 1, 0), nextDelay);
+            
         }).catch(e => {
             if (attempt < 2) {
-                console.log('<- GROQ сеть (', e.message, ') — повтор через 10 сек');
-                return setTimeout(() => tryChunk(ci, attempt + 1), 10000);
+                console.log('<- GROQ сеть (', e.message, ') — повтор через 5 сек');
+                return setTimeout(() => tryChunk(ci, attempt + 1), 5000);
             }
             if (ci + 1 < chunks.length) return setTimeout(() => tryChunk(ci + 1, 0), PAUSE_BETWEEN_CHUNKS);
             done(false, 502, Buffer.from('conn: ' + e.message));
@@ -263,4 +280,7 @@ wss.on('connection', (ws) => {
     ws.on('close', () => { if (upstream) upstream.destroy(); });
 });
 
-server.listen(3000, () => console.log('Relay ready (SAFE MODE) | CHUNK=1 PAUSE=30s 429PAUSE=120s'));
+server.listen(3000, () => {
+    console.log('Relay ready (FAST MULTI-KEY) | Ключей загружено:', GROQ_KEYS.length);
+    console.log('CHUNK=1 | PAUSE=2s | 429PAUSE=60s');
+});
