@@ -16,11 +16,11 @@ const GROQ_MODEL = process.env.GROQ_MODEL || 'qwen/qwen3.8-27b';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const GROQ_HOST = 'api.groq.com';
 
-// 🚀 ОТПРАВЛЯЕМ ВСЕ 5 ФОТО РАЗОМ, ЧТОБЫ ИИ ВИДЕЛ ВСЮ КАРТИНУ
-const CHUNK_SIZE = 5; 
-const MAX_TOKENS = 1200; // Увеличено, чтобы ИИ мог перечислить все танки
-const PAUSE_BETWEEN_CHUNKS = 2000; // 2 секунды между пачками (если фото > 5)
-const PAUSE_ON_429 = 60000; // 1 минута, если все ключи забанились
+// 🚀 ОТПРАВЛЯЕМ ПО 3 ФОТО (Максимум для Groq)
+const CHUNK_SIZE = 3; 
+const MAX_TOKENS = 1200; 
+const PAUSE_BETWEEN_CHUNKS = 2000; // 2 секунды между пачками
+const PAUSE_ON_429 = 60000; // 1 минута, если ключи забанились
 const MAX_429_RETRIES = 10; 
 
 let keyOffset = 0; 
@@ -146,7 +146,7 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-app.get('/', (req, res) => res.send('Relay OK (full-photo)'));
+app.get('/', (req, res) => res.send('Relay OK (chunk-3)'));
 app.get('/api/v1/models', (req, res) => res.json({ data: [{ id: 'qwen-vision' }] }));
 
 const GROQ_MODELS = [GROQ_MODEL, 'qwen/qwen3.8-27b'];
@@ -279,6 +279,6 @@ wss.on('connection', (ws) => {
 });
 
 server.listen(3000, () => {
-    console.log('Relay ready (HIGH RES) | Ключей загружено:', GROQ_KEYS.length);
-    console.log('CHUNK=5 | MAX_TOKENS=1200 | PAUSE=2s');
+    console.log('Relay ready (CHUNK-3) | Ключей загружено:', GROQ_KEYS.length);
+    console.log('CHUNK=3 | MAX_TOKENS=1200 | PAUSE=2s');
 });
