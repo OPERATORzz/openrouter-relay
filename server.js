@@ -11,16 +11,17 @@ app.use(express.json({ limit: '50mb' }));
 
 const rawKeys = process.env.GROQ_API_KEY || '';
 const GROQ_KEYS = rawKeys.split(',').map(k => k.trim()).filter(Boolean);
-// 🚨 СМЕНИЛИ МОДЕЛЬ НА ОФИЦИАЛЬНУЮ LLAMA VISION
-const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.2-11b-vision-preview';
+// 🚨 АКТУАЛЬНАЯ МУЛЬТИМОДАЛЬНАЯ МОДЕЛЬ (старая llama-3.2 удалена из Groq)
+const GROQ_MODEL = process.env.GROQ_MODEL || 'qwen/qwen3.8-27b';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const GROQ_HOST = 'api.groq.com';
 
-const CHUNK_SIZE = 1; // 🚨 СТРОГО ПО 1 ФОТО
-const MAX_TOKENS = 600; 
-const PAUSE_BETWEEN_CHUNKS = 3000; // 3 секунды между фото
-const PAUSE_ON_429 = 30000; // Ждем 30 сек, если все ключи забанились
-const MAX_429_RETRIES = 3; 
+// 🚨 qwen3.8 поддерживает максимум 3 фото за раз
+const CHUNK_SIZE = 3;
+const MAX_TOKENS = 1200;
+const PAUSE_BETWEEN_CHUNKS = 3000;
+const PAUSE_ON_429 = 60000;
+const MAX_429_RETRIES = 5;
 
 function dohResolve(hostname) {
     return new Promise((resolve, reject) => {
@@ -143,10 +144,10 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-app.get('/', (req, res) => res.send('Relay OK (llama-vision)'));
+app.get('/', (req, res) => res.send('Relay OK (qwen-vision)'));
 app.get('/api/v1/models', (req, res) => res.json({ data: [{ id: 'qwen-vision' }] }));
 
-const GROQ_MODELS = [GROQ_MODEL, 'llama-3.2-11b-vision-preview'];
+const GROQ_MODELS = [GROQ_MODEL, 'qwen/qwen3.8-27b'];
 function extractImages(oai) {
     const imgs = []; for (const m of (oai.messages || [])) { if (Array.isArray(m.content)) { for (const c of m.content) if (c.type === 'image_url') imgs.push(c); } } return imgs;
 }
@@ -199,9 +200,9 @@ function sendGroq(oai, res, done) {
             if (r.status === 429) {
                 if (attempt >= MAX_429_RETRIES) {
                     console.log('<- GROQ 429. Сдаюсь на пачке', ci + 1);
-                    return tryChunk(ci + 1, 0); // Пропускаем пачку
+                    return tryChunk(ci + 1, 0);
                 }
-                console.log('<- GROQ 429. Жду 30 сек...');
+                console.log('<- GROQ 429. Жду', PAUSE_ON_429 / 1000, 'сек...');
                 return setTimeout(() => tryChunk(ci, attempt + 1), PAUSE_ON_429);
             }
             if (r.status === 404 && r.body.toString().includes('model_not_found')) {
@@ -226,10 +227,12 @@ function sendGroq(oai, res, done) {
             } catch (e) { console.log('<- GROQ: пачка', ci + 1, 'мусор, пропускаю'); }
             
             const nextDelay = (ci + 1 < chunks.length) ? PAUSE_BETWEEN_CHUNKS : 0;
+            if (nextDelay) console.log('   ...пауза', nextDelay / 1000, 'сек до следующей пачки');
             setTimeout(() => tryChunk(ci + 1, 0), nextDelay);
             
         }).catch(e => {
             if (attempt < 2) {
+                console.log('<- GROQ сеть (', e.message, ') — повтор через 5 сек');
                 return setTimeout(() => tryChunk(ci, attempt + 1), 5000);
             }
             if (ci + 1 < chunks.length) return setTimeout(() => tryChunk(ci + 1, 0), PAUSE_BETWEEN_CHUNKS);
@@ -273,6 +276,6 @@ wss.on('connection', (ws) => {
 });
 
 server.listen(3000, () => {
-    console.log('Relay ready (LLAMA VISION) | Ключей загружено:', GROQ_KEYS.length);
-    console.log('CHUNK=1 | MAX_TOKENS=600 | PAUSE=3s');
+    console.log('Relay ready (QWEN VISION) | Ключей загружено:', GROQ_KEYS.length);
+    console.log('CHUNK=3 | MAX_TOKENS=1200 | PAUSE=3s');
 });
