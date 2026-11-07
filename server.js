@@ -16,14 +16,14 @@ const GROQ_MODEL = process.env.GROQ_MODEL || 'qwen/qwen3.8-27b';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const GROQ_HOST = 'api.groq.com';
 
-// 🚀 УСКОРЕННЫЕ НАСТРОЙКИ (чередуем ключи, пауза 2 сек)
-const CHUNK_SIZE = 1; 
-const MAX_TOKENS = 600;
-const PAUSE_BETWEEN_CHUNKS = 2000; // Всего 2 секунды! (вместо 30)
-const PAUSE_ON_429 = 60000; // 1 минута, если оба ключа забанились
+// 🚀 ОТПРАВЛЯЕМ ВСЕ 5 ФОТО РАЗОМ, ЧТОБЫ ИИ ВИДЕЛ ВСЮ КАРТИНУ
+const CHUNK_SIZE = 5; 
+const MAX_TOKENS = 1200; // Увеличено, чтобы ИИ мог перечислить все танки
+const PAUSE_BETWEEN_CHUNKS = 2000; // 2 секунды между пачками (если фото > 5)
+const PAUSE_ON_429 = 60000; // 1 минута, если все ключи забанились
 const MAX_429_RETRIES = 10; 
 
-let keyOffset = 0; // Для чередования ключей
+let keyOffset = 0; 
 
 function dohResolve(hostname) {
     return new Promise((resolve, reject) => {
@@ -146,7 +146,7 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-app.get('/', (req, res) => res.send('Relay OK (fast multi-key)'));
+app.get('/', (req, res) => res.send('Relay OK (full-photo)'));
 app.get('/api/v1/models', (req, res) => res.json({ data: [{ id: 'qwen-vision' }] }));
 
 const GROQ_MODELS = [GROQ_MODEL, 'qwen/qwen3.8-27b'];
@@ -192,7 +192,7 @@ function sendGroq(oai, res, done) {
         const model = GROQ_MODELS[Math.min(modelIdx, GROQ_MODELS.length - 1)];
         const sub = replaceImages(oai, chunks[ci]);
         
-        // 🚀 ЧЕРЕДУЕМ КЛЮЧИ НА КАЖДОЕ ФОТО
+        // 🚀 ЧЕРЕДУЕМ КЛЮЧИ НА КАЖДУЮ ПАЧКУ
         const currentKey = GROQ_KEYS[(ci + attempt) % GROQ_KEYS.length];
         const keyMasked = currentKey.substring(0, 8) + '...' + currentKey.slice(-4);
         
@@ -201,7 +201,6 @@ function sendGroq(oai, res, done) {
         
         rawHttp(GROQ_HOST, '/openai/v1/chat/completions', 'POST', [['Content-Type', 'application/json'], ['Authorization', 'Bearer ' + currentKey]], body).then(r => {
             if (r.status === 429) {
-                // Если ключ забанился, берем следующий
                 if (attempt >= (GROQ_KEYS.length * 2)) {
                     console.log('<- GROQ 429 на ВСЕХ ключах. Жду', PAUSE_ON_429 / 1000, 'сек...');
                     return setTimeout(() => tryChunk(ci, 0), PAUSE_ON_429);
@@ -220,7 +219,6 @@ function sendGroq(oai, res, done) {
                 return done(false, r.status, r.body);
             }
             
-            // УСПЕХ!
             attempt = 0; 
             try {
                 const j = JSON.parse(r.body.toString());
@@ -281,6 +279,6 @@ wss.on('connection', (ws) => {
 });
 
 server.listen(3000, () => {
-    console.log('Relay ready (FAST MULTI-KEY) | Ключей загружено:', GROQ_KEYS.length);
-    console.log('CHUNK=1 | PAUSE=2s | 429PAUSE=60s');
+    console.log('Relay ready (HIGH RES) | Ключей загружено:', GROQ_KEYS.length);
+    console.log('CHUNK=5 | MAX_TOKENS=1200 | PAUSE=2s');
 });
