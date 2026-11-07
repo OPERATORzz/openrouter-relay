@@ -11,12 +11,13 @@ app.use(express.json({ limit: '50mb' }));
 
 const rawKeys = process.env.GROQ_API_KEY || '';
 const GROQ_KEYS = rawKeys.split(',').map(k => k.trim()).filter(Boolean);
-// 🚨 АКТУАЛЬНАЯ МУЛЬТИМОДАЛЬНАЯ МОДЕЛЬ (старая llama-3.2 удалена из Groq)
-const GROQ_MODEL = process.env.GROQ_MODEL || 'qwen/qwen3.8-27b';
+
+// 🚨 СТАВИМ АКТУАЛЬНУЮ LLAMA 4 MAVERICK (Vision)
+const GROQ_MODEL = process.env.GROQ_MODEL || 'meta-llama/llama-4-maverick-17b-128e-instruct';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const GROQ_HOST = 'api.groq.com';
 
-// 🚨 qwen3.8 поддерживает максимум 3 фото за раз
+// Llama 4 поддерживает до 5 фото, шлем по 3 для безопасности
 const CHUNK_SIZE = 3;
 const MAX_TOKENS = 1200;
 const PAUSE_BETWEEN_CHUNKS = 3000;
@@ -144,10 +145,10 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-app.get('/', (req, res) => res.send('Relay OK (qwen-vision)'));
-app.get('/api/v1/models', (req, res) => res.json({ data: [{ id: 'qwen-vision' }] }));
+app.get('/', (req, res) => res.send('Relay OK (llama-vision)'));
+app.get('/api/v1/models', (req, res) => res.json({ data: [{ id: 'llama-vision' }] }));
 
-const GROQ_MODELS = [GROQ_MODEL, 'qwen/qwen3.8-27b'];
+const GROQ_MODELS = [GROQ_MODEL, 'meta-llama/llama-4-scout-17b-16e-instruct'];
 function extractImages(oai) {
     const imgs = []; for (const m of (oai.messages || [])) { if (Array.isArray(m.content)) { for (const c of m.content) if (c.type === 'image_url') imgs.push(c); } } return imgs;
 }
@@ -183,7 +184,7 @@ function sendGroq(oai, res, done) {
             const merged = mergeResults(results);
             const dt = ((Date.now() - t0) / 1000).toFixed(1);
             console.log('<- GROQ OK: пачек', chunks.length, '| топов', merged.топы.length, '| премов', merged.премы.length, '| за', dt, 'с');
-            const oaiResp = JSON.stringify({ choices: [{ message: { role: 'assistant', content: JSON.stringify(merged) }, index: 0 }], model: 'qwen-chunked' });
+            const oaiResp = JSON.stringify({ choices: [{ message: { role: 'assistant', content: JSON.stringify(merged) }, index: 0 }], model: 'llama-chunked' });
             return done(true, 200, Buffer.from(oaiResp));
         }
         
@@ -276,6 +277,6 @@ wss.on('connection', (ws) => {
 });
 
 server.listen(3000, () => {
-    console.log('Relay ready (QWEN VISION) | Ключей загружено:', GROQ_KEYS.length);
+    console.log('Relay ready (LLAMA 4 VISION) | Ключей загружено:', GROQ_KEYS.length);
     console.log('CHUNK=3 | MAX_TOKENS=1200 | PAUSE=3s');
 });
