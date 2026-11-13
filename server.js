@@ -12,11 +12,9 @@ app.use(express.json({ limit: '50mb' }));
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const GEMINI_HOST = 'generativelanguage.googleapis.com';
-
-// 🚨 ИСПОЛЬЗУЕМ СТАБИЛЬНУЮ МОДЕЛЬ
 const GEMINI_MODEL = 'gemini-1.5-flash-latest'; 
 
-// Отправляем по 1 фото для максимальной точности
+// 🚨 ОТПРАВЛЯЕМ ПО 1 ФОТО ДЛЯ МАКСИМАЛЬНОЙ ТОЧНОСТИ
 const CHUNK_SIZE = 1; 
 const MAX_TOKENS = 2048; 
 
@@ -141,7 +139,7 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-app.get('/', (req, res) => res.send('Relay OK (Gemini-Bearer)'));
+app.get('/', (req, res) => res.send('Relay OK (Gemini-URLKey)'));
 app.get('/api/v1/models', (req, res) => res.json({ data: [{ id: 'gemini-vision' }] }));
 
 function extractImages(oai) {
@@ -207,13 +205,9 @@ function sendGemini(oai, res, done) {
 
         console.log('-> GEMINI пачка', ci + 1, '/', chunks.length, '| попытка', attempt + 1);
 
-        const path = `/v1beta/models/${GEMINI_MODEL}:generateContent`;
-        
-        // 🚨 ПЕРЕДАЕМ КЛЮЧ В ЗАГОЛОВКЕ (Bearer), ТАК КАК ЭТО OAUTH ТОКЕН
-        const headers = [
-            ['Content-Type', 'application/json'],
-            ['Authorization', 'Bearer ' + GEMINI_KEY]
-        ];
+        // 🚨 ПЕРЕДАЕМ КЛЮЧ В URL, ТАК КАК AQ-ТОКЕН НЕ РАБОТАЕТ С BEARER
+        const path = `/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`;
+        const headers = [['Content-Type', 'application/json']];
 
         rawHttp(GEMINI_HOST, path, 'POST', headers, body).then(r => {
             if (r.status !== 200) {
@@ -285,6 +279,6 @@ wss.on('connection', (ws) => {
 });
 
 server.listen(3000, () => {
-    console.log('Relay ready (GEMINI BEARER)');
+    console.log('Relay ready (GEMINI URL KEY)');
     console.log('CHUNK=1 | MAX_TOKENS=2048');
 });
