@@ -11,18 +11,15 @@ app.use(express.json({ limit: '50mb' }));
 
 const rawKeys = process.env.GROQ_API_KEY || '';
 const GROQ_KEYS = rawKeys.split(',').map(k => k.trim()).filter(Boolean);
-
-// 🚨 СТАВИМ Llama 4 Maverick — она лучше читает мелкий текст
 const GROQ_MODEL = process.env.GROQ_MODEL || 'meta-llama/llama-4-maverick-17b-128e-instruct';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const GROQ_HOST = 'api.groq.com';
 
-// Llama 4 Maverick отлично работает с пачками по 3 фото
 const CHUNK_SIZE = 3;
 const MAX_TOKENS = 1200;
 const PAUSE_BETWEEN_CHUNKS = 3000;
 const PAUSE_ON_429 = 60000;
-const MAX_429_RETRIES = 5;
+const MAX_429_RETRIES = 3;
 
 function dohResolve(hostname) {
     return new Promise((resolve, reject) => {
@@ -149,6 +146,7 @@ app.get('/', (req, res) => res.send('Relay OK (llama-4-maverick)'));
 app.get('/api/v1/models', (req, res) => res.json({ data: [{ id: 'qwen-vision' }] }));
 
 const GROQ_MODELS = [GROQ_MODEL, 'meta-llama/llama-4-scout-17b-16e-instruct', 'qwen/qwen3.8-27b'];
+
 function extractImages(oai) {
     const imgs = []; for (const m of (oai.messages || [])) { if (Array.isArray(m.content)) { for (const c of m.content) if (c.type === 'image_url') imgs.push(c); } } return imgs;
 }
@@ -160,12 +158,15 @@ function normalizeTank(s) { return String(s || '').toLowerCase().replace(/[\s\-_
 function mergeResults(results) {
     const topsMap = new Map(); const premsMap = new Map(); let silver = null, gold = null;
     const pushUnique = (map, name) => {
-        const s = String(name).trim(); if (!s || s.length < 3 || s.length > 60) return;
+        const s = String(name).trim(); if (!s || s.length < 2 || s.length > 60) return;
         const key = normalizeTank(s); if (!key) return; if (!map.has(key)) map.set(key, s);
     };
     for (const r of results) {
-        for (const t of (r.топы || [])) pushUnique(topsMap, t);
-        for (const p of (r.премы || [])) pushUnique(premsMap, p);
+        // 🚨 ГИБКИЙ ПАРСИНГ (если ИИ вернул tanks вместо топы)
+        const tops = r.топы || r.tanks || r.tops || [];
+        const prems = r.премы || r.premiums || r.prem || [];
+        for (const t of tops) pushUnique(topsMap, t);
+        for (const p of prems) pushUnique(premsMap, p);
         if (r.серебро) silver = r.серебро; if (r.золото) gold = r.золото;
     }
     return { 'топы': [...topsMap.values()], 'премы': [...premsMap.values()], 'серебро': silver, 'золото': gold };
@@ -194,7 +195,7 @@ function sendGroq(oai, res, done) {
         const currentKey = GROQ_KEYS[(ci + attempt) % GROQ_KEYS.length];
         const keyMasked = currentKey.substring(0, 8) + '...' + currentKey.slice(-4);
         
-        const body = JSON.stringify({ model: model, temperature: (oai.temperature != null ? oai.temperature : 0.2), messages: sub.messages, max_tokens: MAX_TOKENS });
+        const body = JSON.stringify({ model: model, temperature: 0.1, messages: sub.messages, max_tokens: MAX_TOKENS });
         console.log('-> GROQ пачка', ci + 1, '/', chunks.length, '| фото:', chunks[ci].length, '| попытка', attempt + 1, '| Ключ:', keyMasked, '| Модель:', model);
         
         rawHttp(GROQ_HOST, '/openai/v1/chat/completions', 'POST', [['Content-Type', 'application/json'], ['Authorization', 'Bearer ' + currentKey]], body).then(r => {
