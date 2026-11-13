@@ -13,13 +13,10 @@ const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const GEMINI_HOST = 'generativelanguage.googleapis.com';
 
-// 🚨 ТОЛЬКО АКТУАЛЬНЫЕ VISION-МОДЕЛИ (БЕЗ TTS И УСТАРЕВШИХ)
+// 🚨 ЖЕЛЕЗОБЕТОННЫЕ МОДЕЛИ, КОТОРЫЕ ТОЧНО ЕСТЬ У ВСЕХ
 const GEMINI_MODELS = [
-    'gemini-3.8-flash',
-    'gemini-3.5-flash',
-    'gemini-3-pro',
-    'gemini-3-flash-lite',
-    'gemini-2.0-flash'
+    'gemini-1.5-flash',
+    'gemini-1.5-pro'
 ];
 
 const CHUNK_SIZE = 1;
@@ -53,19 +50,28 @@ async function resolveAny(hostname) {
     try { return await dns.promises.lookup(hostname); } catch (e) { const ip = await dohResolve(hostname); return { address: ip }; }
 }
 
+// 🚨 УЛУЧШЕННЫЙ RAW HTTP С ТАЙМАУТОМ (ЧТОБЫ НЕ ВИСНУТЬ)
 function rawHttp(host, path, method, headers, body) {
     method = method || 'GET'; headers = headers || [];
     return new Promise((resolve, reject) => {
         resolveAny(host).then(({ address }) => {
             const sock = net.connect(443, address, () => {
+                // Ставим таймаут 30 секунд. Если Google молчит - рвем связь.
+                sock.setTimeout(30000, () => {
+                    sock.destroy();
+                    reject(new Error('Timeout 30s'));
+                });
+
                 const t = tls.connect({ socket: sock, servername: host }, () => {
                     let h = method + ' ' + path + ' HTTP/1.1\r\nHost: ' + host + '\r\nUser-Agent: relay\r\nConnection: close\r\n';
                     for (const k of headers) h += k[0] + ': ' + k[1] + '\r\n';
                     if (body) h += 'Content-Length: ' + Buffer.byteLength(body) + '\r\n';
                     h += '\r\n'; t.write(h); if (body) t.write(body);
                 });
-                let raw = Buffer.alloc(0); t.on('data', c => { raw = Buffer.concat([raw, c]); });
+                let raw = Buffer.alloc(0); 
+                t.on('data', c => { raw = Buffer.concat([raw, c]); });
                 t.on('end', () => {
+                    sock.setTimeout(0); // Сбрасываем таймаут
                     const idx = raw.indexOf('\r\n\r\n'); if (idx === -1) return reject(new Error('no headers'));
                     const head = raw.slice(0, idx).toString('latin1'); const status = parseInt(head.split(' ')[1], 10) || 502;
                     let b = raw.slice(idx + 4);
@@ -80,7 +86,7 @@ function rawHttp(host, path, method, headers, body) {
                     }
                     resolve({ status, body: b });
                 });
-                t.on('error', reject);
+                t.on('error', (e) => { sock.destroy(); reject(e); });
             });
             sock.on('error', reject);
         }).catch(reject);
@@ -221,13 +227,12 @@ function sendGemini(oai, res, done) {
         ];
 
         rawHttp(GEMINI_HOST, path, 'POST', headers, body).then(r => {
-            // Если модель не подходит (404, 400, 503) - переключаемся на следующую
             if (r.status !== 200) {
                 console.log(`<- GEMINI ошибка ${r.status} (${currentModel}). Переключаюсь...`);
                 modelIdx++;
                 if (modelIdx >= GEMINI_MODELS.length) {
                     console.log('<- Все модели перебраны. Пропускаю фото.');
-                    return tryChunk(ci + 1);
+                    return tryChunk(ci + 1); // Пропускаем фото, чтобы не висеть
                 }
                 return setTimeout(() => tryChunk(ci), 1000);
             }
@@ -247,11 +252,15 @@ function sendGemini(oai, res, done) {
                 console.log(`<- GEMINI пачка ${ci + 1} OK (модель: ${currentModel})`);
             } catch (e) { console.log('<- GEMINI: мусор в ответе'); }
             
-            modelIdx = 0; // Сброс при успехе
+            modelIdx = 0; 
             setTimeout(() => tryChunk(ci + 1), 1000);
         }).catch(e => {
-            console.log('<- GEMINI сеть (', e.message, ')');
-            setTimeout(() => tryChunk(ci + 1), 2000);
+            console.log('<- GEMINI ошибка сети/timeout (', e.message, '). Меняю модель...');
+            modelIdx++;
+            if (modelIdx >= GEMINI_MODELS.length) {
+                return tryChunk(ci + 1); // Идем дальше
+            }
+            setTimeout(() => tryChunk(ci), 1000);
         });
     };
     tryChunk(0);
