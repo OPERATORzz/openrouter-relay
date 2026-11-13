@@ -13,14 +13,8 @@ const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const GEMINI_HOST = 'generativelanguage.googleapis.com';
 
-// 🚨 СПИСОК МОДЕЛЕЙ (При ошибке 503 сразу прыгаем на следующую)
-const GEMINI_MODELS = [
-    'gemini-2.5-flash',
-    'gemini-3.8-flash',
-    'gemini-1.5-flash-latest',
-    'gemini-1.5-pro-latest'
-];
-
+// Сюда мы будем собирать рабочие модели
+let GEMINI_MODELS = ['gemini-3.8-flash', 'gemini-1.5-flash-latest']; 
 const CHUNK_SIZE = 1;
 const MAX_TOKENS = 2048;
 
@@ -87,6 +81,41 @@ function rawHttp(host, path, method, headers, body) {
 }
 const httpGet = (host, path) => rawHttp(host, path);
 
+// 🚨 ФУНКЦИЯ ПРОВЕРКИ ДОСТУПНЫХ МОДЕЛЕЙ
+async function checkAvailableModels() {
+    if (!GEMINI_KEY) return;
+    console.log('🔍 Запрашиваю у Google список доступных моделей...');
+    try {
+        const headers = [['x-goog-api-key', GEMINI_KEY]];
+        const r = await rawHttp(GEMINI_HOST, '/v1beta/models', 'GET', headers);
+        
+        if (r.status === 200) {
+            const j = JSON.parse(r.body.toString());
+            if (j.models && j.models.length > 0) {
+                console.log('✅ Доступные модели:');
+                // Оставляем только те, которые поддерживают генерацию контента (vision)
+                const visionModels = j.models.filter(m => m.supportedGenerationMethods?.includes('generateContent'));
+                for (const m of visionModels) {
+                    const cleanName = m.name.replace('models/', '');
+                    console.log(`- ${cleanName}`);
+                }
+                // Автоматически ставим самую свежую модель из списка
+                if (visionModels.length > 0) {
+                    GEMINI_MODELS = visionModels.map(m => m.name.replace('models/', ''));
+                    console.log('🚀 Автоматически выбраны модели:', GEMINI_MODELS.join(', '));
+                }
+            } else {
+                console.log('⚠️ Список моделей пуст.');
+            }
+        } else {
+            console.log(`❌ Ошибка получения списка моделей. Код: ${r.status}`);
+            console.log('Тело ответа:', r.body.toString().slice(0, 300));
+        }
+    } catch (e) {
+        console.log('❌ Ошибка при проверке моделей:', e.message);
+    }
+}
+
 let tgOffset = 0, tgCurrentPhotos = [], tgLots = [], tgPendingCreds = {};
 function finishLot(chatId, creds) {
     if (!tgCurrentPhotos.length) return;
@@ -145,7 +174,7 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-app.get('/', (req, res) => res.send('Relay OK (Gemini-Fast-Fallback)'));
+app.get('/', (req, res) => res.send('Relay OK (Gemini-Models-Check)'));
 app.get('/api/v1/models', (req, res) => res.json({ data: [{ id: 'gemini-vision' }] }));
 
 function extractImages(oai) {
@@ -177,7 +206,6 @@ function sendGemini(oai, res, done) {
     const results = [];
     const t0 = Date.now();
     
-    // Индекс текущей модели
     let modelIdx = 0; 
 
     const tryChunk = (ci) => {
@@ -221,21 +249,19 @@ function sendGemini(oai, res, done) {
         ];
 
         rawHttp(GEMINI_HOST, path, 'POST', headers, body).then(r => {
-            // 🚨 ЕСЛИ 503 (ПЕРЕГРУЗКА) - СРАЗУ МЕНЯЕМ МОДЕЛЬ
             if (r.status === 503) {
-                console.log('<- GEMINI 503 (Перегрузка). Меняю модель...');
-                modelIdx++; // Берем следующую модель
-                return setTimeout(() => tryChunk(ci), 2000); // Ждем 2 сек и пробуем снова
+                console.log('<- GEMINI 503. Меняю модель...');
+                modelIdx++; 
+                return setTimeout(() => tryChunk(ci), 2000); 
             }
             
             if (r.status !== 200) {
                 console.log('<- GEMINI ошибка', r.status);
-                // Если 404 - модель не найдена, тоже меняем
                 if (r.status === 404) {
                     modelIdx++;
                     return setTimeout(() => tryChunk(ci), 1000);
                 }
-                return tryChunk(ci + 1); // Для других ошибок пропускаем фото
+                return tryChunk(ci + 1); 
             }
             
             try {
@@ -248,13 +274,12 @@ function sendGemini(oai, res, done) {
                     const parsed = JSON.parse(m[0]);
                     const tops = parsed.топы || parsed.tanks || [];
                     const prems = parsed.премы || parsed.premiums || [];
-                    
                     results.push({ топы: tops, премы: prems });
                 }
                 console.log(`<- GEMINI пачка ${ci + 1} OK`);
             } catch (e) { console.log('<- GEMINI: мусор в ответе'); }
             
-            modelIdx = 0; // При успехе сбрасываем индекс на первую модель
+            modelIdx = 0; 
             setTimeout(() => tryChunk(ci + 1), 1000);
         }).catch(e => {
             console.log('<- GEMINI сеть (', e.message, ')');
@@ -297,8 +322,8 @@ wss.on('connection', (ws) => {
     ws.on('close', () => { if (upstream) upstream.destroy(); });
 });
 
-server.listen(3000, () => {
-    console.log('Relay ready (GEMINI FAST FALLBACK)');
-    console.log('MODELS:', GEMINI_MODELS.join(', '));
+server.listen(3000, async () => {
+    console.log('Relay ready (GEMINI AUTO-MODEL)');
+    await checkAvailableModels(); // 🚨 Проверяем модели при старте
     console.log('CHUNK=1 | MAX_TOKENS=2048');
 });
