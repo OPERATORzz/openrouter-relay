@@ -13,10 +13,9 @@ const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const GEMINI_HOST = 'generativelanguage.googleapis.com';
 
-// 🚨 ЖЕЛЕЗОБЕТОННЫЕ МОДЕЛИ, КОТОРЫЕ ТОЧНО ЕСТЬ У ВСЕХ
+// 🚨 АКТУАЛЬНАЯ МОДЕЛЬ (ПРОВЕРЕНА)
 const GEMINI_MODELS = [
-    'gemini-1.5-flash',
-    'gemini-1.5-pro'
+    'gemini-3.8-flash'
 ];
 
 const CHUNK_SIZE = 1;
@@ -50,13 +49,11 @@ async function resolveAny(hostname) {
     try { return await dns.promises.lookup(hostname); } catch (e) { const ip = await dohResolve(hostname); return { address: ip }; }
 }
 
-// 🚨 УЛУЧШЕННЫЙ RAW HTTP С ТАЙМАУТОМ (ЧТОБЫ НЕ ВИСНУТЬ)
 function rawHttp(host, path, method, headers, body) {
     method = method || 'GET'; headers = headers || [];
     return new Promise((resolve, reject) => {
         resolveAny(host).then(({ address }) => {
             const sock = net.connect(443, address, () => {
-                // Ставим таймаут 30 секунд. Если Google молчит - рвем связь.
                 sock.setTimeout(30000, () => {
                     sock.destroy();
                     reject(new Error('Timeout 30s'));
@@ -71,7 +68,7 @@ function rawHttp(host, path, method, headers, body) {
                 let raw = Buffer.alloc(0); 
                 t.on('data', c => { raw = Buffer.concat([raw, c]); });
                 t.on('end', () => {
-                    sock.setTimeout(0); // Сбрасываем таймаут
+                    sock.setTimeout(0);
                     const idx = raw.indexOf('\r\n\r\n'); if (idx === -1) return reject(new Error('no headers'));
                     const head = raw.slice(0, idx).toString('latin1'); const status = parseInt(head.split(' ')[1], 10) || 502;
                     let b = raw.slice(idx + 4);
@@ -152,7 +149,7 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-app.get('/', (req, res) => res.send('Relay OK (Gemini-Vision-Final)'));
+app.get('/', (req, res) => res.send('Relay OK (Gemini-3.8-Final)'));
 app.get('/api/v1/models', (req, res) => res.json({ data: [{ id: 'gemini-vision' }] }));
 
 function extractImages(oai) {
@@ -184,8 +181,6 @@ function sendGemini(oai, res, done) {
     const results = [];
     const t0 = Date.now();
     
-    let modelIdx = 0; 
-
     const tryChunk = (ci) => {
         if (ci >= chunks.length) {
             const merged = mergeResults(results);
@@ -217,7 +212,7 @@ function sendGemini(oai, res, done) {
             generationConfig: { temperature: 0.1, maxOutputTokens: MAX_TOKENS }
         });
 
-        const currentModel = GEMINI_MODELS[Math.min(modelIdx, GEMINI_MODELS.length - 1)];
+        const currentModel = GEMINI_MODELS[0];
         console.log(`-> GEMINI пачка ${ci + 1}/${chunks.length} | модель: ${currentModel}`);
 
         const path = `/v1beta/models/${currentModel}:generateContent`;
@@ -228,13 +223,8 @@ function sendGemini(oai, res, done) {
 
         rawHttp(GEMINI_HOST, path, 'POST', headers, body).then(r => {
             if (r.status !== 200) {
-                console.log(`<- GEMINI ошибка ${r.status} (${currentModel}). Переключаюсь...`);
-                modelIdx++;
-                if (modelIdx >= GEMINI_MODELS.length) {
-                    console.log('<- Все модели перебраны. Пропускаю фото.');
-                    return tryChunk(ci + 1); // Пропускаем фото, чтобы не висеть
-                }
-                return setTimeout(() => tryChunk(ci), 1000);
+                console.log(`<- GEMINI ошибка ${r.status} (${currentModel})`);
+                return tryChunk(ci + 1);
             }
             
             try {
@@ -249,18 +239,13 @@ function sendGemini(oai, res, done) {
                     const prems = parsed.премы || parsed.premiums || [];
                     results.push({ топы: tops, премы: prems });
                 }
-                console.log(`<- GEMINI пачка ${ci + 1} OK (модель: ${currentModel})`);
+                console.log(`<- GEMINI пачка ${ci + 1} OK`);
             } catch (e) { console.log('<- GEMINI: мусор в ответе'); }
             
-            modelIdx = 0; 
             setTimeout(() => tryChunk(ci + 1), 1000);
         }).catch(e => {
-            console.log('<- GEMINI ошибка сети/timeout (', e.message, '). Меняю модель...');
-            modelIdx++;
-            if (modelIdx >= GEMINI_MODELS.length) {
-                return tryChunk(ci + 1); // Идем дальше
-            }
-            setTimeout(() => tryChunk(ci), 1000);
+            console.log('<- GEMINI сеть (', e.message, ')');
+            setTimeout(() => tryChunk(ci + 1), 2000);
         });
     };
     tryChunk(0);
@@ -300,7 +285,7 @@ wss.on('connection', (ws) => {
 });
 
 server.listen(3000, () => {
-    console.log('Relay ready (GEMINI VISION FINAL)');
-    console.log('MODELS:', GEMINI_MODELS.join(', '));
+    console.log('Relay ready (GEMINI 3.8 FLASH)');
+    console.log('MODEL:', GEMINI_MODELS[0]);
     console.log('CHUNK=1 | MAX_TOKENS=2048');
 });
