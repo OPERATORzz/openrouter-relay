@@ -9,16 +9,16 @@ const dns = require('dns');
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 
-const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
+// 🚨 КЛЮЧ ОТ ROUTERAPI (из переменных окружения Render)
+const ROUTERAPI_KEY = process.env.ROUTERAPI_API_KEY || '';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
-const GEMINI_HOST = 'generativelanguage.googleapis.com';
+const ROUTERAPI_HOST = 'routerapi.ru';
 
-// 🚨 ТОЛЬКО РАБОЧАЯ МОДЕЛЬ
-const GEMINI_MODELS = ['gemini-3.8-flash'];
+// 🚨 МОДЕЛЬ GPT-4o MINI (ОТЛИЧНО ВИДИТ ТЕКСТ)
+const MODEL = 'openai/gpt-4o-mini';
 
-const CHUNK_SIZE = 1;
+const CHUNK_SIZE = 2; // Отправляем по 2 фото, чтобы не перегружать контекст
 const MAX_TOKENS = 2048;
-const DELAY_BETWEEN_PHOTOS = 10000; // 🚨 10 СЕКУНД ПАУЗЫ МЕЖДУ ФОТО (чтобы не ловить 429)
 
 function dohResolve(hostname) {
     return new Promise((resolve, reject) => {
@@ -53,9 +53,9 @@ function rawHttp(host, path, method, headers, body) {
     return new Promise((resolve, reject) => {
         resolveAny(host).then(({ address }) => {
             const sock = net.connect(443, address, () => {
-                sock.setTimeout(30000, () => {
+                sock.setTimeout(45000, () => {
                     sock.destroy();
-                    reject(new Error('Timeout 30s'));
+                    reject(new Error('Timeout 45s'));
                 });
 
                 const t = tls.connect({ socket: sock, servername: host }, () => {
@@ -148,8 +148,8 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-app.get('/', (req, res) => res.send('Relay OK (Gemini-Smart-Pacing)'));
-app.get('/api/v1/models', (req, res) => res.json({ data: [{ id: 'gemini-vision' }] }));
+app.get('/', (req, res) => res.send('Relay OK (RouterAPI GPT-4o Mini)'));
+app.get('/api/v1/models', (req, res) => res.json({ data: [{ id: 'routerapi-vision' }] }));
 
 function extractImages(oai) {
     const imgs = []; for (const m of (oai.messages || [])) { if (Array.isArray(m.content)) { for (const c of m.content) if (c.type === 'image_url') imgs.push(c); } } return imgs;
@@ -172,74 +172,54 @@ function mergeResults(results) {
     return { 'топы': [...topsMap.values()], 'премы': [...premsMap.values()] };
 }
 
-function sendGemini(oai, res, done) {
-    if (!GEMINI_KEY) return done(false, 401, Buffer.from('no GEMINI_API_KEY'));
+function sendRouterAPI(oai, res, done) {
+    if (!ROUTERAPI_KEY) return done(false, 401, Buffer.from('no ROUTERAPI_API_KEY'));
     const imgs = extractImages(oai);
     const chunks = []; for (let i = 0; i < imgs.length; i += CHUNK_SIZE) chunks.push(imgs.slice(i, i + CHUNK_SIZE));
     if (!chunks.length) chunks.push([]);
     const results = [];
     const t0 = Date.now();
-    
+
     const tryChunk = (ci, attempt) => {
         attempt = attempt || 0;
         if (ci >= chunks.length) {
             const merged = mergeResults(results);
             const dt = ((Date.now() - t0) / 1000).toFixed(1);
-            console.log('<- GEMINI OK: пачек', chunks.length, '| топов', merged.топы.length, '| премов', merged.премы.length, '| за', dt, 'с');
-            const oaiResp = JSON.stringify({ choices: [{ message: { role: 'assistant', content: JSON.stringify(merged) }, index: 0 }], model: 'gemini-chunked' });
+            console.log('<- ROUTERAPI OK: пачек', chunks.length, '| топов', merged.топы.length, '| премов', merged.премы.length, '| за', dt, 'с');
+            const oaiResp = JSON.stringify({ choices: [{ message: { role: 'assistant', content: JSON.stringify(merged) }, index: 0 }], model: 'routerapi-chunked' });
             return done(true, 200, Buffer.from(oaiResp));
         }
 
         const sub = replaceImages(oai, chunks[ci]);
-        
-        const parts = [];
-        for (const msg of sub.messages) {
-            if (typeof msg.content === 'string') {
-                parts.push({ text: msg.content });
-            } else if (Array.isArray(msg.content)) {
-                for (const item of msg.content) {
-                    if (item.type === 'text') parts.push({ text: item.text });
-                    else if (item.type === 'image_url') {
-                        const b64 = item.image_url.url.split(',')[1];
-                        parts.push({ inline_data: { mime_type: 'image/jpeg', data: b64 } });
-                    }
-                }
-            }
-        }
-
         const body = JSON.stringify({
-            contents: [{ role: 'user', parts: parts }],
-            generationConfig: { temperature: 0.1, maxOutputTokens: MAX_TOKENS }
+            model: MODEL,
+            messages: sub.messages,
+            max_tokens: MAX_TOKENS
         });
 
-        const currentModel = GEMINI_MODELS[0];
-        console.log(`-> GEMINI пачка ${ci + 1}/${chunks.length} | модель: ${currentModel} | попытка: ${attempt + 1}`);
+        console.log(`-> ROUTERAPI пачка ${ci + 1}/${chunks.length} | модель: ${MODEL} | попытка: ${attempt + 1}`);
 
-        const path = `/v1beta/models/${currentModel}:generateContent`;
+        const path = '/api/v1/chat/completions';
         const headers = [
             ['Content-Type', 'application/json'],
-            ['x-goog-api-key', GEMINI_KEY]
+            ['Authorization', 'Bearer ' + ROUTERAPI_KEY]
         ];
 
-        rawHttp(GEMINI_HOST, path, 'POST', headers, body).then(r => {
+        rawHttp(ROUTERAPI_HOST, path, 'POST', headers, body).then(r => {
             if (r.status === 429) {
-                console.log(`<- GEMINI 429 (Лимит). Жду 20 сек...`);
-                return setTimeout(() => tryChunk(ci, attempt + 1), 20000);
+                console.log(`<- ROUTERAPI 429 (Лимит). Жду 15 сек...`);
+                return setTimeout(() => tryChunk(ci, attempt + 1), 15000);
             }
-            if (r.status === 503) {
-                console.log(`<- GEMINI 503 (Перегрузка). Жду 10 сек...`);
-                return setTimeout(() => tryChunk(ci, attempt + 1), 10000);
-            }
-            
             if (r.status !== 200) {
-                console.log(`<- GEMINI ошибка ${r.status}`);
-                return tryChunk(ci + 1, 0);
+                console.log(`<- ROUTERAPI ошибка ${r.status}`);
+                try { console.log('Тело:', r.body.toString().slice(0, 200)); } catch(e){}
+                return tryChunk(ci + 1);
             }
             
             try {
                 const j = JSON.parse(r.body.toString());
-                if (!j.candidates || !j.candidates[0] || !j.candidates[0].content) throw new Error('no content');
-                let text = j.candidates[0].content.parts[0].text;
+                if (!j.choices || !j.choices[0]) throw new Error('no content');
+                let text = j.choices[0].message.content;
                 
                 const m = String(text).match(/\{[\s\S]*\}/);
                 if (m) {
@@ -248,14 +228,13 @@ function sendGemini(oai, res, done) {
                     const prems = parsed.премы || parsed.premiums || [];
                     results.push({ топы: tops, премы: prems });
                 }
-                console.log(`<- GEMINI пачка ${ci + 1} OK`);
-            } catch (e) { console.log('<- GEMINI: мусор в ответе'); }
+                console.log(`<- ROUTERAPI пачка ${ci + 1} OK`);
+            } catch (e) { console.log('<- ROUTERAPI: мусор в ответе'); }
             
-            // 🚨 ПАУЗА 10 СЕК ПЕРЕД СЛЕДУЮЩИМ ФОТО
-            setTimeout(() => tryChunk(ci + 1, 0), DELAY_BETWEEN_PHOTOS);
+            setTimeout(() => tryChunk(ci + 1, 0), 2000);
         }).catch(e => {
-            console.log(`<- GEMINI сеть (${e.message}). Жду 5 сек...`);
-            setTimeout(() => tryChunk(ci, attempt + 1), 5000);
+            console.log(`<- ROUTERAPI сеть (${e.message})`);
+            setTimeout(() => tryChunk(ci + 1, 0), 3000);
         });
     };
     tryChunk(0, 0);
@@ -264,9 +243,9 @@ function sendGemini(oai, res, done) {
 app.post('/api/v1/chat/completions', (req, res) => {
     const oai = req.body;
     console.log('-> запрос | фото:', extractImages(oai).length);
-    sendGemini(oai, res, (ok, status, payload) => {
+    sendRouterAPI(oai, res, (ok, status, payload) => {
         if (ok) return res.status(200).type('application/json').send(payload);
-        res.status(status).type('application/json').send(payload);
+        return res.status(status).type('application/json').send(payload);
     });
 });
 
@@ -295,7 +274,7 @@ wss.on('connection', (ws) => {
 });
 
 server.listen(3000, () => {
-    console.log('Relay ready (GEMINI PACING)');
-    console.log('MODEL:', GEMINI_MODELS[0]);
-    console.log('CHUNK=1 | MAX_TOKENS=2048 | DELAY=10s');
+    console.log('Relay ready (ROUTERAPI GPT-4o MINI)');
+    console.log('MODEL:', MODEL);
+    console.log('CHUNK=2 | MAX_TOKENS=2048');
 });
