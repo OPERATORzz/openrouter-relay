@@ -12,11 +12,11 @@ app.use(express.json({ limit: '50mb' }));
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const GEMINI_HOST = 'generativelanguage.googleapis.com';
-const GEMINI_MODEL = 'gemini-1.5-flash-latest'; 
+const GEMINI_MODEL = 'gemini-1.5-flash-latest';
 
-// 🚨 ОТПРАВЛЯЕМ ПО 1 ФОТО ДЛЯ МАКСИМАЛЬНОЙ ТОЧНОСТИ
-const CHUNK_SIZE = 1; 
-const MAX_TOKENS = 2048; 
+// 🚨 Отправляем по 1 фото для максимальной точности
+const CHUNK_SIZE = 1;
+const MAX_TOKENS = 2048;
 
 function dohResolve(hostname) {
     return new Promise((resolve, reject) => {
@@ -139,7 +139,7 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-app.get('/', (req, res) => res.send('Relay OK (Gemini-URLKey)'));
+app.get('/', (req, res) => res.send('Relay OK (Gemini-x-goog-api-key)'));
 app.get('/api/v1/models', (req, res) => res.json({ data: [{ id: 'gemini-vision' }] }));
 
 function extractImages(oai) {
@@ -205,9 +205,13 @@ function sendGemini(oai, res, done) {
 
         console.log('-> GEMINI пачка', ci + 1, '/', chunks.length, '| попытка', attempt + 1);
 
-        // 🚨 ПЕРЕДАЕМ КЛЮЧ В URL, ТАК КАК AQ-ТОКЕН НЕ РАБОТАЕТ С BEARER
-        const path = `/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`;
-        const headers = [['Content-Type', 'application/json']];
+        const path = `/v1beta/models/${GEMINI_MODEL}:generateContent`;
+        
+        // 🚨 ИСПОЛЬЗУЕМ ПРАВИЛЬНЫЙ ЗАГОЛОВОК ДЛЯ КЛЮЧЕЙ AQ.
+        const headers = [
+            ['Content-Type', 'application/json'],
+            ['x-goog-api-key', GEMINI_KEY]
+        ];
 
         rawHttp(GEMINI_HOST, path, 'POST', headers, body).then(r => {
             if (r.status !== 200) {
@@ -279,6 +283,6 @@ wss.on('connection', (ws) => {
 });
 
 server.listen(3000, () => {
-    console.log('Relay ready (GEMINI URL KEY)');
+    console.log('Relay ready (GEMINI x-goog-api-key)');
     console.log('CHUNK=1 | MAX_TOKENS=2048');
 });
