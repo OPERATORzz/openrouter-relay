@@ -9,17 +9,15 @@ const dns = require('dns');
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 
-const rawKeys = process.env.GROQ_API_KEY || '';
-const GROQ_KEYS = rawKeys.split(',').map(k => k.trim()).filter(Boolean);
-const GROQ_MODEL = process.env.GROQ_MODEL || 'meta-llama/llama-4-maverick-17b-128e-instruct';
+// 🚨 ТУТ БУДЕТ ТВОЙ КЛЮЧ GEMINI (из переменной окружения)
+const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
-const GROQ_HOST = 'api.groq.com';
+const GEMINI_HOST = 'generativelanguage.googleapis.com';
+const GEMINI_MODEL = 'gemini-1.5-flash';
 
-const CHUNK_SIZE = 3;
-const MAX_TOKENS = 1200;
-const PAUSE_BETWEEN_CHUNKS = 3000;
-const PAUSE_ON_429 = 60000;
-const MAX_429_RETRIES = 3;
+// Gemini отлично жует по 3-5 фото за раз
+const CHUNK_SIZE = 3; 
+const MAX_TOKENS = 2048; 
 
 function dohResolve(hostname) {
     return new Promise((resolve, reject) => {
@@ -142,10 +140,8 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-app.get('/', (req, res) => res.send('Relay OK (llama-4-maverick)'));
-app.get('/api/v1/models', (req, res) => res.json({ data: [{ id: 'qwen-vision' }] }));
-
-const GROQ_MODELS = [GROQ_MODEL, 'meta-llama/llama-4-scout-17b-16e-instruct', 'qwen/qwen3.8-27b'];
+app.get('/', (req, res) => res.send('Relay OK (Gemini)'));
+app.get('/api/v1/models', (req, res) => res.json({ data: [{ id: 'gemini-vision' }] }));
 
 function extractImages(oai) {
     const imgs = []; for (const m of (oai.messages || [])) { if (Array.isArray(m.content)) { for (const c of m.content) if (c.type === 'image_url') imgs.push(c); } } return imgs;
@@ -156,98 +152,96 @@ function replaceImages(oai, imgs) {
 }
 function normalizeTank(s) { return String(s || '').toLowerCase().replace(/[\s\-_.]/g, '').replace(/[«»"'`]/g, '').trim(); }
 function mergeResults(results) {
-    const topsMap = new Map(); const premsMap = new Map(); let silver = null, gold = null;
+    const topsMap = new Map(); const premsMap = new Map();
     const pushUnique = (map, name) => {
         const s = String(name).trim(); if (!s || s.length < 2 || s.length > 60) return;
         const key = normalizeTank(s); if (!key) return; if (!map.has(key)) map.set(key, s);
     };
     for (const r of results) {
-        // 🚨 ГИБКИЙ ПАРСИНГ (если ИИ вернул tanks вместо топы)
-        const tops = r.топы || r.tanks || r.tops || [];
-        const prems = r.премы || r.premiums || r.prem || [];
-        for (const t of tops) pushUnique(topsMap, t);
-        for (const p of prems) pushUnique(premsMap, p);
-        if (r.серебро) silver = r.серебро; if (r.золото) gold = r.золото;
+        for (const t of (r.топы || [])) pushUnique(topsMap, t);
+        for (const p of (r.премы || [])) pushUnique(premsMap, p);
     }
-    return { 'топы': [...topsMap.values()], 'премы': [...premsMap.values()], 'серебро': silver, 'золото': gold };
+    return { 'топы': [...topsMap.values()], 'премы': [...premsMap.values()] };
 }
 
-function sendGroq(oai, res, done) {
-    if (!GROQ_KEYS.length) return done(false, 401, Buffer.from('no GROQ_API_KEY'));
+function sendGemini(oai, res, done) {
+    if (!GEMINI_KEY) return done(false, 401, Buffer.from('no GEMINI_API_KEY'));
     const imgs = extractImages(oai);
     const chunks = []; for (let i = 0; i < imgs.length; i += CHUNK_SIZE) chunks.push(imgs.slice(i, i + CHUNK_SIZE));
     if (!chunks.length) chunks.push([]);
-    const results = []; let modelIdx = 0; const t0 = Date.now();
-    
-    const tryChunk = (ci, attempt) => {
-        attempt = attempt || 0;
+    const results = [];
+    const t0 = Date.now();
+
+    const tryChunk = (ci) => {
         if (ci >= chunks.length) {
             const merged = mergeResults(results);
             const dt = ((Date.now() - t0) / 1000).toFixed(1);
-            console.log('<- GROQ OK: пачек', chunks.length, '| топов', merged.топы.length, '| премов', merged.премы.length, '| за', dt, 'с');
-            const oaiResp = JSON.stringify({ choices: [{ message: { role: 'assistant', content: JSON.stringify(merged) }, index: 0 }], model: 'llama-chunked' });
+            console.log('<- GEMINI OK: пачек', chunks.length, '| топов', merged.топы.length, '| премов', merged.премы.length, '| за', dt, 'с');
+            const oaiResp = JSON.stringify({ choices: [{ message: { role: 'assistant', content: JSON.stringify(merged) }, index: 0 }], model: 'gemini-chunked' });
             return done(true, 200, Buffer.from(oaiResp));
         }
-        
-        const model = GROQ_MODELS[Math.min(modelIdx, GROQ_MODELS.length - 1)];
+
         const sub = replaceImages(oai, chunks[ci]);
         
-        const currentKey = GROQ_KEYS[(ci + attempt) % GROQ_KEYS.length];
-        const keyMasked = currentKey.substring(0, 8) + '...' + currentKey.slice(-4);
-        
-        const body = JSON.stringify({ model: model, temperature: 0.1, messages: sub.messages, max_tokens: MAX_TOKENS });
-        console.log('-> GROQ пачка', ci + 1, '/', chunks.length, '| фото:', chunks[ci].length, '| попытка', attempt + 1, '| Ключ:', keyMasked, '| Модель:', model);
-        
-        rawHttp(GROQ_HOST, '/openai/v1/chat/completions', 'POST', [['Content-Type', 'application/json'], ['Authorization', 'Bearer ' + currentKey]], body).then(r => {
-            if (r.status === 429) {
-                if (attempt >= MAX_429_RETRIES) {
-                    console.log('<- GROQ 429. Сдаюсь на пачке', ci + 1);
-                    return tryChunk(ci + 1, 0);
+        // Формируем запрос под формат Gemini API
+        const parts = [];
+        for (const msg of sub.messages) {
+            if (typeof msg.content === 'string') {
+                parts.push({ text: msg.content });
+            } else if (Array.isArray(msg.content)) {
+                for (const item of msg.content) {
+                    if (item.type === 'text') parts.push({ text: item.text });
+                    else if (item.type === 'image_url') {
+                        const b64 = item.image_url.url.split(',')[1];
+                        parts.push({ inline_data: { mime_type: 'image/jpeg', data: b64 } });
+                    }
                 }
-                console.log('<- GROQ 429. Жду', PAUSE_ON_429 / 1000, 'сек...');
-                return setTimeout(() => tryChunk(ci, attempt + 1), PAUSE_ON_429);
             }
-            if (r.status === 404 && r.body.toString().includes('model_not_found')) {
-                modelIdx++;
-                if (modelIdx < GROQ_MODELS.length) return tryChunk(ci, 0);
-                return done(false, 404, r.body);
-            }
+        }
+
+        const body = JSON.stringify({
+            contents: [{ role: 'user', parts: parts }],
+            generationConfig: { temperature: 0.1, maxOutputTokens: MAX_TOKENS }
+        });
+
+        console.log('-> GEMINI пачка', ci + 1, '/', chunks.length, '| фото:', chunks[ci].length);
+
+        const path = `/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`;
+        rawHttp(GEMINI_HOST, path, 'POST', [['Content-Type', 'application/json']], body).then(r => {
             if (r.status !== 200) {
-                console.log('<- GROQ ошибка', r.status, 'на пачке', ci + 1, '— пропускаю её');
-                if (ci + 1 < chunks.length) return setTimeout(() => tryChunk(ci + 1, 0), PAUSE_BETWEEN_CHUNKS);
-                return done(false, r.status, r.body);
+                console.log('<- GEMINI ошибка', r.status, 'на пачке', ci + 1);
+                return tryChunk(ci + 1);
             }
-            
-            attempt = 0; 
             try {
                 const j = JSON.parse(r.body.toString());
-                let text = j.choices[0].message.content;
-                if (Array.isArray(text)) text = (text.find(p => p.type === 'text') || {}).text || '';
+                if (!j.candidates || !j.candidates[0] || !j.candidates[0].content) throw new Error('no content');
+                let text = j.candidates[0].content.parts[0].text;
+                
+                // Извлекаем JSON из ответа
                 const m = String(text).match(/\{[\s\S]*\}/);
-                if (m) results.push(JSON.parse(m[0]));
-                console.log('<- GROQ пачка', ci + 1, 'OK');
-            } catch (e) { console.log('<- GROQ: пачка', ci + 1, 'мусор, пропускаю'); }
+                if (m) {
+                    const parsed = JSON.parse(m[0]);
+                    // Гибкий парсинг
+                    const tops = parsed.топы || parsed.tanks || [];
+                    const prems = parsed.премы || parsed.premiums || [];
+                    results.push({ топы: tops, премы: prems });
+                }
+                console.log('<- GEMINI пачка', ci + 1, 'OK');
+            } catch (e) { console.log('<- GEMINI: пачка', ci + 1, 'мусор, пропускаю'); }
             
-            const nextDelay = (ci + 1 < chunks.length) ? PAUSE_BETWEEN_CHUNKS : 0;
-            if (nextDelay) console.log('   ...пауза', nextDelay / 1000, 'сек до следующей пачки');
-            setTimeout(() => tryChunk(ci + 1, 0), nextDelay);
-            
+            setTimeout(() => tryChunk(ci + 1), 1000);
         }).catch(e => {
-            if (attempt < 2) {
-                console.log('<- GROQ сеть (', e.message, ') — повтор через 5 сек');
-                return setTimeout(() => tryChunk(ci, attempt + 1), 5000);
-            }
-            if (ci + 1 < chunks.length) return setTimeout(() => tryChunk(ci + 1, 0), PAUSE_BETWEEN_CHUNKS);
-            done(false, 502, Buffer.from('conn: ' + e.message));
+            console.log('<- GEMINI сеть (', e.message, ')');
+            setTimeout(() => tryChunk(ci + 1), 2000);
         });
     };
-    tryChunk(0, 0);
+    tryChunk(0);
 }
 
 app.post('/api/v1/chat/completions', (req, res) => {
     const oai = req.body;
     console.log('-> запрос | фото:', extractImages(oai).length);
-    sendGroq(oai, res, (ok, status, payload) => {
+    sendGemini(oai, res, (ok, status, payload) => {
         if (ok) return res.status(200).type('application/json').send(payload);
         res.status(status).type('application/json').send(payload);
     });
@@ -278,6 +272,6 @@ wss.on('connection', (ws) => {
 });
 
 server.listen(3000, () => {
-    console.log('Relay ready (LLAMA 4 MAVERICK) | Ключей загружено:', GROQ_KEYS.length);
-    console.log('CHUNK=3 | MAX_TOKENS=1200 | PAUSE=3s');
+    console.log('Relay ready (GEMINI VISION)');
+    console.log('CHUNK=3 | MAX_TOKENS=2048');
 });
