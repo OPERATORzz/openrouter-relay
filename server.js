@@ -12,9 +12,11 @@ app.use(express.json({ limit: '50mb' }));
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const GEMINI_HOST = 'generativelanguage.googleapis.com';
-const GEMINI_MODEL = 'gemini-1.5-flash';
 
-// 🚨 ОТПРАВЛЯЕМ ПО 1 ФОТО ДЛЯ МАКСИМАЛЬНОЙ ТОЧНОСТИ
+// 🚨 ИСПОЛЬЗУЕМ СТАБИЛЬНУЮ МОДЕЛЬ
+const GEMINI_MODEL = 'gemini-1.5-flash-latest'; 
+
+// Отправляем по 1 фото для максимальной точности
 const CHUNK_SIZE = 1; 
 const MAX_TOKENS = 2048; 
 
@@ -139,7 +141,7 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-app.get('/', (req, res) => res.send('Relay OK (Gemini-1-by-1)'));
+app.get('/', (req, res) => res.send('Relay OK (Gemini-Bearer)'));
 app.get('/api/v1/models', (req, res) => res.json({ data: [{ id: 'gemini-vision' }] }));
 
 function extractImages(oai) {
@@ -205,10 +207,18 @@ function sendGemini(oai, res, done) {
 
         console.log('-> GEMINI пачка', ci + 1, '/', chunks.length, '| попытка', attempt + 1);
 
-        const path = `/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`;
-        rawHttp(GEMINI_HOST, path, 'POST', [['Content-Type', 'application/json']], body).then(r => {
+        const path = `/v1beta/models/${GEMINI_MODEL}:generateContent`;
+        
+        // 🚨 ПЕРЕДАЕМ КЛЮЧ В ЗАГОЛОВКЕ (Bearer), ТАК КАК ЭТО OAUTH ТОКЕН
+        const headers = [
+            ['Content-Type', 'application/json'],
+            ['Authorization', 'Bearer ' + GEMINI_KEY]
+        ];
+
+        rawHttp(GEMINI_HOST, path, 'POST', headers, body).then(r => {
             if (r.status !== 200) {
                 console.log('<- GEMINI ошибка', r.status);
+                try { console.log('Тело ошибки:', r.body.toString().slice(0, 200)); } catch(e){}
                 return tryChunk(ci + 1, 0);
             }
             try {
@@ -222,7 +232,6 @@ function sendGemini(oai, res, done) {
                     const tops = parsed.топы || parsed.tanks || [];
                     const prems = parsed.премы || parsed.premiums || [];
                     
-                    // 🚨 ЕСЛИ ПУСТО - ПРОБУЕМ ЕЩЕ РАЗ (до 2 раз)
                     if (tops.length === 0 && prems.length === 0 && attempt < 2) {
                         console.log('<- GEMINI вернула пустоту, пробую еще раз...');
                         return setTimeout(() => tryChunk(ci, attempt + 1), 1000);
@@ -276,6 +285,6 @@ wss.on('connection', (ws) => {
 });
 
 server.listen(3000, () => {
-    console.log('Relay ready (GEMINI 1-BY-1 + RETRY)');
+    console.log('Relay ready (GEMINI BEARER)');
     console.log('CHUNK=1 | MAX_TOKENS=2048');
 });
