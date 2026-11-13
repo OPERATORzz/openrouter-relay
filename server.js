@@ -13,8 +13,8 @@ const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const GEMINI_HOST = 'generativelanguage.googleapis.com';
 
-// 🚨 АКТУАЛЬНАЯ МОДЕЛЬ (1.5-flash-latest устарела)
-const GEMINI_MODEL = 'gemini-2.5-flash';
+// 🚨 САМАЯ АКТУАЛЬНАЯ МОДЕЛЬ
+const GEMINI_MODEL = 'gemini-3.8-flash';
 
 const CHUNK_SIZE = 1;
 const MAX_TOKENS = 2048;
@@ -140,7 +140,7 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-app.get('/', (req, res) => res.send('Relay OK (Gemini-2.5)'));
+app.get('/', (req, res) => res.send('Relay OK (Gemini-3.8)'));
 app.get('/api/v1/models', (req, res) => res.json({ data: [{ id: 'gemini-vision' }] }));
 
 function extractImages(oai) {
@@ -283,6 +283,6 @@ wss.on('connection', (ws) => {
 });
 
 server.listen(3000, () => {
-    console.log('Relay ready (GEMINI 2.5 FLASH)');
+    console.log('Relay ready (GEMINI 3.8 FLASH)');
     console.log('CHUNK=1 | MAX_TOKENS=2048');
 });
