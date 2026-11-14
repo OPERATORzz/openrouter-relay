@@ -9,15 +9,12 @@ const dns = require('dns');
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 
-// 🚨 КЛЮЧ ОТ ROUTERAPI (из переменных окружения Render)
 const ROUTERAPI_KEY = process.env.ROUTERAPI_API_KEY || '';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const ROUTERAPI_HOST = 'routerapi.ru';
 
-// 🚨 МОДЕЛЬ GPT-4o MINI (ОТЛИЧНО ВИДИТ ТЕКСТ)
 const MODEL = 'openai/gpt-4o-mini';
-
-const CHUNK_SIZE = 2; // Отправляем по 2 фото, чтобы не перегружать контекст
+const CHUNK_SIZE = 2; 
 const MAX_TOKENS = 2048;
 
 function dohResolve(hostname) {
@@ -53,10 +50,7 @@ function rawHttp(host, path, method, headers, body) {
     return new Promise((resolve, reject) => {
         resolveAny(host).then(({ address }) => {
             const sock = net.connect(443, address, () => {
-                sock.setTimeout(45000, () => {
-                    sock.destroy();
-                    reject(new Error('Timeout 45s'));
-                });
+                sock.setTimeout(45000, () => { sock.destroy(); reject(new Error('Timeout 45s')); });
 
                 const t = tls.connect({ socket: sock, servername: host }, () => {
                     let h = method + ' ' + path + ' HTTP/1.1\r\nHost: ' + host + '\r\nUser-Agent: relay\r\nConnection: close\r\n';
@@ -148,12 +142,27 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-app.get('/', (req, res) => res.send('Relay OK (RouterAPI GPT-4o Mini)'));
+app.get('/', (req, res) => res.send('Relay OK (RouterAPI GPT-4o Mini LowDetail)'));
 app.get('/api/v1/models', (req, res) => res.json({ data: [{ id: 'routerapi-vision' }] }));
 
 function extractImages(oai) {
-    const imgs = []; for (const m of (oai.messages || [])) { if (Array.isArray(m.content)) { for (const c of m.content) if (c.type === 'image_url') imgs.push(c); } } return imgs;
+    const imgs = []; 
+    for (const m of (oai.messages || [])) { 
+        if (Array.isArray(m.content)) { 
+            for (const c of m.content) {
+                if (c.type === 'image_url') {
+                    // 🚨 ВКЛЮЧАЕМ РЕЖИМ НИЗКОГО ДЕТАЛИЗИРОВАНИЯ
+                    if (c.image_url && typeof c.image_url === 'object') {
+                        c.image_url.detail = 'low';
+                    }
+                    imgs.push(c); 
+                }
+            } 
+        } 
+    } 
+    return imgs;
 }
+
 function replaceImages(oai, imgs) {
     const o = JSON.parse(JSON.stringify(oai));
     for (const m of o.messages) { if (Array.isArray(m.content)) { const texts = m.content.filter(c => c.type === 'text'); m.content = [...texts, ...imgs]; return o; } } return o;
@@ -212,7 +221,6 @@ function sendRouterAPI(oai, res, done) {
             }
             if (r.status !== 200) {
                 console.log(`<- ROUTERAPI ошибка ${r.status}`);
-                try { console.log('Тело:', r.body.toString().slice(0, 200)); } catch(e){}
                 return tryChunk(ci + 1);
             }
             
@@ -274,7 +282,7 @@ wss.on('connection', (ws) => {
 });
 
 server.listen(3000, () => {
-    console.log('Relay ready (ROUTERAPI GPT-4o MINI)');
+    console.log('Relay ready (ROUTERAPI GPT-4o MINI LOW DETAIL)');
     console.log('MODEL:', MODEL);
     console.log('CHUNK=2 | MAX_TOKENS=2048');
 });
