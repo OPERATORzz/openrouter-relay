@@ -17,6 +17,16 @@ const MODEL = 'openai/gpt-4o-mini';
 const CHUNK_SIZE = 2; 
 const MAX_TOKENS = 2048;
 
+// Сколько раз повторять ОДНУ пачку при разных типах сбоя.
+// Раньше 429 повторялся бесконечно, а любой другой не-200 молча хоронил пачку.
+const MAX_RETRY_429 = 6;
+const MAX_RETRY_503 = 4;
+const MAX_RETRY_OTHER = 3;
+const MAX_RETRY_PARSE = 2;
+const WAIT_429_MS = 15000;
+const WAIT_503_MS = 10000;
+const WAIT_OTHER_MS = 5000;
+
 function dohResolve(hostname) {
     return new Promise((resolve, reject) => {
         const servers = [ { ip: '1.1.1.1', name: 'cloudflare-dns.com' }, { ip: '8.8.8.8', name: 'dns.google' } ];
@@ -84,11 +94,47 @@ function rawHttp(host, path, method, headers, body) {
 }
 const httpGet = (host, path) => rawHttp(host, path);
 
-let tgOffset = 0, tgCurrentPhotos = [], tgLots = [], tgPendingCreds = {};
+let tgOffset = 0, tgLots = [], tgPendingCreds = {};
+
+// Раньше фото лежали в одной глобальной переменной tgCurrentPhotos:
+//  · фото из одного чата могли уехать в лот другого;
+//  · присланные «впрок» фото не истекали и приклеивались к следующему аккаунту;
+//  · лоты без подтверждения висели в памяти вечно.
+// Теперь фото хранятся по чатам и стареют, а лоты ограничены TTL и количеством.
+const TG_PHOTO_TTL = 30 * 60 * 1000;   // 30 минут — фото старше считаем брошенными
+const TG_LOT_TTL = 2 * 60 * 60 * 1000; // 2 часа на обработку лота
+const TG_MAX_LOTS = 50;                // больше 50 неотвеченных лотов не держим
+const tgPhotosByChat = new Map();
+
+function tgPhotos(chatId) {
+    const rec = tgPhotosByChat.get(chatId);
+    if (!rec) return [];
+    if (Date.now() - rec.at > TG_PHOTO_TTL) { tgPhotosByChat.delete(chatId); return []; }
+    return rec.list;
+}
+
+function tgPushPhoto(chatId, fileId) {
+    let rec = tgPhotosByChat.get(chatId);
+    if (!rec || Date.now() - rec.at > TG_PHOTO_TTL) rec = { list: [], at: Date.now() };
+    rec.list.push(fileId);
+    rec.at = Date.now();
+    tgPhotosByChat.set(chatId, rec);
+}
+
+function tgPruneLots() {
+    const now = Date.now();
+    const before = tgLots.length;
+    tgLots = tgLots.filter(l => now - (l.at || 0) < TG_LOT_TTL);
+    if (tgLots.length > TG_MAX_LOTS) tgLots = tgLots.slice(-TG_MAX_LOTS);
+    if (before !== tgLots.length) console.log('🧹 TG: убрано просроченных лотов: ' + (before - tgLots.length));
+}
+
 function finishLot(chatId, creds) {
-    if (!tgCurrentPhotos.length) return;
-    tgLots.push({ id: Date.now() + '_' + Math.random().toString(36).slice(2, 7), chatId, creds, photos: tgCurrentPhotos });
-    tgCurrentPhotos = [];
+    const photos = tgPhotos(chatId);
+    if (!photos.length) return;
+    tgPhotosByChat.delete(chatId);
+    tgLots.push({ id: Date.now() + '_' + Math.random().toString(36).slice(2, 7), chatId, creds, photos, at: Date.now() });
+    tgPruneLots();
 }
 
 app.get('/tg/poll', async (req, res) => {
@@ -101,7 +147,7 @@ app.get('/tg/poll', async (req, res) => {
                 tgOffset = u.update_id + 1; const msg = u.message || u.channel_post; if (!msg) continue;
                 const chatId = msg.chat.id;
                 if (msg.photo && msg.photo.length) {
-                    tgCurrentPhotos.push(msg.photo[msg.photo.length - 1].file_id);
+                    tgPushPhoto(chatId, msg.photo[msg.photo.length - 1].file_id);
                     if (msg.caption && msg.caption.includes(':')) finishLot(chatId, msg.caption.trim());
                 } else if (msg.text && !msg.text.startsWith('/')) {
                     const txt = msg.text.trim();
@@ -110,11 +156,12 @@ app.get('/tg/poll', async (req, res) => {
                         if (txt.includes(':')) creds = txt.replace(/^(готово|done)\s*:?\s*/i, '').trim();
                         if (creds) finishLot(chatId, creds);
                     } else if (txt.includes(':')) {
-                        if (tgCurrentPhotos.length) finishLot(chatId, txt); else tgPendingCreds[chatId] = txt;
+                        if (tgPhotos(chatId).length) finishLot(chatId, txt); else tgPendingCreds[chatId] = txt;
                     }
                 }
             }
         }
+        tgPruneLots();
         res.json({ lots: tgLots.map(l => ({ id: l.id, creds: l.creds, photos: l.photos })) });
     } catch (e) { res.status(500).json({ error: String(e.message) }); }
 });
@@ -142,7 +189,7 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-app.get('/', (req, res) => res.send('Relay OK (RouterAPI GPT-4o Mini LowDetail)'));
+app.get('/', (req, res) => res.send('Relay OK (RouterAPI GPT-4o Mini LowDetail) | partial-guard v2 | auth: ' + (RELAY_TOKEN ? 'on' : 'off')));
 app.get('/api/v1/models', (req, res) => res.json({ data: [{ id: 'routerapi-vision' }] }));
 
 function extractImages(oai) {
@@ -187,17 +234,48 @@ function sendRouterAPI(oai, res, done) {
     const chunks = []; for (let i = 0; i < imgs.length; i += CHUNK_SIZE) chunks.push(imgs.slice(i, i + CHUNK_SIZE));
     if (!chunks.length) chunks.push([]);
     const results = [];
+    const failures = [];
     const t0 = Date.now();
+
+    // Финал: считаем, сколько пачек реально прошло.
+    // - ни одна не прошла  -> 503, клиент повторит весь запрос;
+    // - часть не прошла    -> 200 + partial:true, клиент НЕ должен публиковать лот.
+    const finish = () => {
+        const merged = mergeResults(results);
+        const dt = ((Date.now() - t0) / 1000).toFixed(1);
+        const partial = failures.length > 0;
+        console.log('<- ROUTERAPI ' + (partial ? 'НЕПОЛНЫЙ' : 'OK') +
+            ' | пачек ' + chunks.length + ' | ок ' + results.length + ' | провалено ' + failures.length +
+            ' | топов ' + merged.топы.length + ' | премов ' + merged.премы.length + ' | за ' + dt + ' с');
+
+        if (results.length === 0 && failures.length > 0) {
+            console.log('<- ROUTERAPI ВСЕ пачки провалены:', JSON.stringify(failures));
+            return done(false, 503, Buffer.from(JSON.stringify({ error: { message: 'all chunks failed' }, partial: true, failures: failures })));
+        }
+
+        if (partial) console.log('<- ROUTERAPI провалы:', JSON.stringify(failures));
+
+        const content = {
+            'топы': merged.топы,
+            'премы': merged.премы,
+            'partial': partial,
+            'chunks': chunks.length,
+            'chunksOk': results.length,
+            'failures': failures
+        };
+        const oaiResp = JSON.stringify({ choices: [{ message: { role: 'assistant', content: JSON.stringify(content) }, index: 0 }], model: 'routerapi-chunked' });
+        return done(true, 200, Buffer.from(oaiResp));
+    };
+
+    const markFailed = (ci, status, reason) => {
+        failures.push({ index: ci + 1, status: status, reason: String(reason || '').slice(0, 120) });
+        console.log('<- ROUTERAPI пачка ' + (ci + 1) + '/' + chunks.length + ' ПРОВАЛЕНА (' + status + ': ' + reason + ')');
+        setTimeout(() => tryChunk(ci + 1, 0), 1000);
+    };
 
     const tryChunk = (ci, attempt) => {
         attempt = attempt || 0;
-        if (ci >= chunks.length) {
-            const merged = mergeResults(results);
-            const dt = ((Date.now() - t0) / 1000).toFixed(1);
-            console.log('<- ROUTERAPI OK: пачек', chunks.length, '| топов', merged.топы.length, '| премов', merged.премы.length, '| за', dt, 'с');
-            const oaiResp = JSON.stringify({ choices: [{ message: { role: 'assistant', content: JSON.stringify(merged) }, index: 0 }], model: 'routerapi-chunked' });
-            return done(true, 200, Buffer.from(oaiResp));
-        }
+        if (ci >= chunks.length) return finish();
 
         const sub = replaceImages(oai, chunks[ci]);
         const body = JSON.stringify({
@@ -206,7 +284,7 @@ function sendRouterAPI(oai, res, done) {
             max_tokens: MAX_TOKENS
         });
 
-        console.log(`-> ROUTERAPI пачка ${ci + 1}/${chunks.length} | модель: ${MODEL} | попытка: ${attempt + 1}`);
+        console.log('-> ROUTERAPI пачка ' + (ci + 1) + '/' + chunks.length + ' | модель: ' + MODEL + ' | попытка: ' + (attempt + 1));
 
         const path = '/api/v1/chat/completions';
         const headers = [
@@ -216,37 +294,76 @@ function sendRouterAPI(oai, res, done) {
 
         rawHttp(ROUTERAPI_HOST, path, 'POST', headers, body).then(r => {
             if (r.status === 429) {
-                console.log(`<- ROUTERAPI 429 (Лимит). Жду 15 сек...`);
-                return setTimeout(() => tryChunk(ci, attempt + 1), 15000);
+                if (attempt >= MAX_RETRY_429) return markFailed(ci, 429, 'лимит запросов, попытки кончились');
+                console.log('<- ROUTERAPI 429 (лимит). Жду ' + Math.round(WAIT_429_MS / 1000) + ' с...');
+                return setTimeout(() => tryChunk(ci, attempt + 1), WAIT_429_MS);
+            }
+            if (r.status === 503 || r.status === 502 || r.status === 504) {
+                if (attempt >= MAX_RETRY_503) return markFailed(ci, r.status, 'сервис недоступен, попытки кончились');
+                console.log('<- ROUTERAPI ' + r.status + '. Жду ' + Math.round(WAIT_503_MS / 1000) + ' с, повторяю эту же пачку...');
+                return setTimeout(() => tryChunk(ci, attempt + 1), WAIT_503_MS);
             }
             if (r.status !== 200) {
-                console.log(`<- ROUTERAPI ошибка ${r.status}`);
-                return tryChunk(ci + 1);
+                if (attempt >= MAX_RETRY_OTHER) return markFailed(ci, r.status, 'неожиданный статус');
+                console.log('<- ROUTERAPI ошибка ' + r.status + '. Повтор через ' + Math.round(WAIT_OTHER_MS / 1000) + ' с...');
+                return setTimeout(() => tryChunk(ci, attempt + 1), WAIT_OTHER_MS);
             }
-            
+
+            let parsed;
             try {
                 const j = JSON.parse(r.body.toString());
                 if (!j.choices || !j.choices[0]) throw new Error('no content');
-                let text = j.choices[0].message.content;
-                
+                const text = j.choices[0].message.content;
                 const m = String(text).match(/\{[\s\S]*\}/);
-                if (m) {
-                    const parsed = JSON.parse(m[0]);
-                    const tops = parsed.топы || parsed.tanks || [];
-                    const prems = parsed.премы || parsed.premiums || [];
-                    results.push({ топы: tops, премы: prems });
-                }
-                console.log(`<- ROUTERAPI пачка ${ci + 1} OK`);
-            } catch (e) { console.log('<- ROUTERAPI: мусор в ответе'); }
-            
+                if (!m) throw new Error('нет JSON в ответе');
+                parsed = JSON.parse(m[0]);
+            } catch (e) {
+                if (attempt >= MAX_RETRY_PARSE) return markFailed(ci, 200, 'мусор в ответе: ' + e.message);
+                console.log('<- ROUTERAPI мусор в ответе (' + e.message + '). Повтор этой же пачки...');
+                return setTimeout(() => tryChunk(ci, attempt + 1), 3000);
+            }
+
+            const tops = parsed.топы || parsed.tanks || [];
+            const prems = parsed.премы || parsed.premiums || [];
+            results.push({ топы: tops, премы: prems });
+            console.log('<- ROUTERAPI пачка ' + (ci + 1) + ' OK | топов ' + tops.length + ' | премов ' + prems.length);
+
             setTimeout(() => tryChunk(ci + 1, 0), 2000);
         }).catch(e => {
-            console.log(`<- ROUTERAPI сеть (${e.message})`);
-            setTimeout(() => tryChunk(ci + 1, 0), 3000);
+            if (attempt >= MAX_RETRY_OTHER) return markFailed(ci, 0, 'сеть: ' + e.message);
+            console.log('<- ROUTERAPI сеть (' + e.message + '). Повтор этой же пачки...');
+            setTimeout(() => tryChunk(ci, attempt + 1), 3000);
         });
     };
     tryChunk(0, 0);
 }
+
+// 🔐 Необязательный токен доступа. Пока переменная RELAY_TOKEN не задана на Render,
+// сервер работает как раньше (без пароля). Как только задана — все запросы к модели
+// и к Telegram-мосту должны присылать заголовок x-relay-token (или ?token=).
+// Это защищает баланс RouterAPI от любого, кто узнал адрес сервиса.
+const RELAY_TOKEN = process.env.RELAY_TOKEN || '';
+
+function tokenFrom(req) {
+    return String(req.get('x-relay-token') || req.query.token || '').trim();
+}
+
+function authOk(req) {
+    if (!RELAY_TOKEN) return true;
+    const t = tokenFrom(req);
+    if (!t) return false;
+    // сравнение постоянного времени, чтобы не давать угадывать токен по таймингам
+    const a = Buffer.from(t), b = Buffer.from(RELAY_TOKEN);
+    if (a.length !== b.length) return false;
+    return require('crypto').timingSafeEqual(a, b);
+}
+
+// Стражи ставятся только на «дорогие» и «чувствительные» маршруты:
+app.use(['/api/v1', '/tg'], (req, res, next) => {
+    if (authOk(req)) return next();
+    console.log('-> 401 | нет/неверный токен | ' + req.method + ' ' + req.path);
+    return res.status(401).json({ error: { message: 'Неверный или отсутствующий токен доступа' } });
+});
 
 app.post('/api/v1/chat/completions', (req, res) => {
     const oai = req.body;
