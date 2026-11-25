@@ -13,8 +13,48 @@ const ROUTERAPI_KEY = process.env.ROUTERAPI_API_KEY || '';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const ROUTERAPI_HOST = 'routerapi.ru';
 
-const MODEL = 'openai/gpt-4o-mini';
-const CHUNK_SIZE = 2; 
+// 🔐 Необязательный токен доступа объявлен ВВЕРХУ, а страж — до маршрутов.
+// Раньше app.use(['/api/v1','/tg']) регистрировался в конце файла, то есть ПОСЛЕ
+// /tg/poll, /tg/file и /api/v1/models. Express применяет middleware по порядку,
+// поэтому все эти маршруты оставались открытыми даже при заданном RELAY_TOKEN —
+// включая чтение фото чужого лота из Telegram.
+const RELAY_TOKEN = process.env.RELAY_TOKEN || '';
+const SERVER_VERSION = '2.2.0';
+
+function tokenFrom(req) {
+    return String(req.get('x-relay-token') || req.query.token || '').trim();
+}
+
+function authOk(req) {
+    if (!RELAY_TOKEN) return true;
+    const t = tokenFrom(req);
+    if (!t) return false;
+    // сравнение постоянного времени, чтобы не давать угадывать токен по таймингам
+    const a = Buffer.from(t), b = Buffer.from(RELAY_TOKEN);
+    if (a.length !== b.length) return false;
+    return require('crypto').timingSafeEqual(a, b);
+}
+
+// Страж ставится ДО маршрутов: только на «дорогие» и «чувствительные» адреса.
+app.use(['/api/v1', '/tg'], (req, res, next) => {
+    if (authOk(req)) return next();
+    console.log('-> 401 | нет/неверный токен | ' + req.method + ' ' + req.path);
+    return res.status(401).json({ error: { message: 'Неверный или отсутствующий токен доступа' } });
+});
+
+// 🧠 Модель распознавания. 25.11 сравнил на реальных скриншотах (5 фото, лот Blitz):
+//   gpt-4o-mini  — 25 названий за 1,35 ₽, часть выдумана («M60A1», «Panzer IV», «Hellcat»),
+//                  а на ПК-скриншоте вообще выдал ряд T-34, T-43, T-44, T-55 — галлюцинация;
+//   gemini-2.5-flash — 28 названий за 0,16 ₽, все реальные, и на ПК прочитал 37 из 38.
+// Gemini и в 8 раз дешевле, и не додумывает. Поэтому основная модель — она.
+const MODEL = process.env.MODEL_NAME || 'google/gemini-2.5-flash';
+// 🚨 CHUNK_SIZE = 1 — ОДНО фото на запрос. 25.11 замерено на реальном лоте ПК:
+//   пачка из 2 фото в одном запросе -> модель читала 15 из 20 названий с одного снимка;
+//   то же фото отдельным запросом   -> 20 из 20, и три прогона подряд дали 20/20/20.
+// Когда в запросе несколько скриншотов, модель «размазывает» внимание и теряет мелкий
+// текст. Цена почти не меняется (накладные ~330 токенов на запрос), а точность растёт.
+// Бонус: если одна пачка упадёт, потеряется одно фото, а не половина лота.
+const CHUNK_SIZE = 1;
 const MAX_TOKENS = 2048;
 
 // Сколько раз повторять ОДНУ пачку при разных типах сбоя.
@@ -68,11 +108,19 @@ function rawHttp(host, path, method, headers, body) {
                     if (body) h += 'Content-Length: ' + Buffer.byteLength(body) + '\r\n';
                     h += '\r\n'; t.write(h); if (body) t.write(body);
                 });
-                let raw = Buffer.alloc(0); 
+                let raw = Buffer.alloc(0);
+                let settled = false;
                 t.on('data', c => { raw = Buffer.concat([raw, c]); });
-                t.on('end', () => {
-                    sock.setTimeout(0);
-                    const idx = raw.indexOf('\r\n\r\n'); if (idx === -1) return reject(new Error('no headers'));
+
+                // Раньше ответ собирался только по 'end'. Если соединение закрывалось
+                // без него (обрыв на стороне RouterAPI, RST), промис не завершался
+                // никогда: пачка висела до таймаута 45 с, а в логах было пусто.
+                const finish = (why) => {
+                    if (settled) return;
+                    settled = true;
+                    try { sock.setTimeout(0); } catch (e) {}
+                    const idx = raw.indexOf('\r\n\r\n');
+                    if (idx === -1) return reject(new Error(why + ': нет заголовков ответа'));
                     const head = raw.slice(0, idx).toString('latin1'); const status = parseInt(head.split(' ')[1], 10) || 502;
                     let b = raw.slice(idx + 4);
                     if (/transfer-encoding:\s*chunked/i.test(head)) {
@@ -85,8 +133,11 @@ function rawHttp(host, path, method, headers, body) {
                         b = out;
                     }
                     resolve({ status, body: b });
-                });
-                t.on('error', (e) => { sock.destroy(); reject(e); });
+                };
+
+                t.on('end', () => finish('end'));
+                t.on('close', () => finish('close'));
+                t.on('error', (e) => { if (settled) return; settled = true; try { sock.destroy(); } catch (_) {} reject(e); });
             });
             sock.on('error', reject);
         }).catch(reject);
@@ -189,7 +240,7 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-app.get('/', (req, res) => res.send('Relay OK (RouterAPI GPT-4o Mini LowDetail) | partial-guard v2 | auth: ' + (RELAY_TOKEN ? 'on' : 'off')));
+app.get('/', (req, res) => res.send('Relay OK (RouterAPI GPT-4o Mini LowDetail) | partial-guard v2 | v' + SERVER_VERSION + ' | auth: ' + (RELAY_TOKEN ? 'on' : 'off')));
 app.get('/api/v1/models', (req, res) => res.json({ data: [{ id: 'routerapi-vision' }] }));
 
 function extractImages(oai) {
@@ -198,9 +249,15 @@ function extractImages(oai) {
         if (Array.isArray(m.content)) { 
             for (const c of m.content) {
                 if (c.type === 'image_url') {
-                    // 🚨 ВКЛЮЧАЕМ РЕЖИМ НИЗКОГО ДЕТАЛИЗИРОВАНИЯ
+                    // 🔍 РЕЖИМ ВЫСОКОЙ ДЕТАЛИЗАЦИИ.
+                    // 25.11 проверили на реальных скриншотах 1280×719: при 'low' картинка
+                    // сжимается до 512 px, текст под иконками становится нечитаемым, и модель
+                    // вместо чтения переписывает словарь из промпта — счёт танков скакал
+                    // 54 / 173 / 60 на ОДНОМ И ТОМ ЖЕ лоте. При 'high' модель реально читает
+                    // («T57 Heavy», «Jg.Pz. E 100», «TVP T 50/51»). Цена: ~0,54 ₽ за фото
+                    // вместо 0,06 ₽, то есть около 2,7 ₽ за лот из 5 фото.
                     if (c.image_url && typeof c.image_url === 'object') {
-                        c.image_url.detail = 'low';
+                        c.image_url.detail = 'high';
                     }
                     imgs.push(c); 
                 }
@@ -323,8 +380,11 @@ function sendRouterAPI(oai, res, done) {
                 return setTimeout(() => tryChunk(ci, attempt + 1), 3000);
             }
 
-            const tops = parsed.топы || parsed.tanks || [];
-            const prems = parsed.премы || parsed.premiums || [];
+            // Клиент может просить два формата: {"tanks":[...]} (мобилка, классифицирует
+            // словарь) или {"tops":[...],"prems":[...]} (ПК, где словаря нет и делит модель).
+            // Латиницу тоже понимаем — иначе ответ ПК-промпта молча терялся.
+            const tops = parsed.топы || parsed.tops || parsed.tanks || parsed.танки || [];
+            const prems = parsed.премы || parsed.prems || parsed.premiums || [];
             results.push({ топы: tops, премы: prems });
             console.log('<- ROUTERAPI пачка ' + (ci + 1) + ' OK | топов ' + tops.length + ' | премов ' + prems.length);
 
@@ -337,33 +397,6 @@ function sendRouterAPI(oai, res, done) {
     };
     tryChunk(0, 0);
 }
-
-// 🔐 Необязательный токен доступа. Пока переменная RELAY_TOKEN не задана на Render,
-// сервер работает как раньше (без пароля). Как только задана — все запросы к модели
-// и к Telegram-мосту должны присылать заголовок x-relay-token (или ?token=).
-// Это защищает баланс RouterAPI от любого, кто узнал адрес сервиса.
-const RELAY_TOKEN = process.env.RELAY_TOKEN || '';
-
-function tokenFrom(req) {
-    return String(req.get('x-relay-token') || req.query.token || '').trim();
-}
-
-function authOk(req) {
-    if (!RELAY_TOKEN) return true;
-    const t = tokenFrom(req);
-    if (!t) return false;
-    // сравнение постоянного времени, чтобы не давать угадывать токен по таймингам
-    const a = Buffer.from(t), b = Buffer.from(RELAY_TOKEN);
-    if (a.length !== b.length) return false;
-    return require('crypto').timingSafeEqual(a, b);
-}
-
-// Стражи ставятся только на «дорогие» и «чувствительные» маршруты:
-app.use(['/api/v1', '/tg'], (req, res, next) => {
-    if (authOk(req)) return next();
-    console.log('-> 401 | нет/неверный токен | ' + req.method + ' ' + req.path);
-    return res.status(401).json({ error: { message: 'Неверный или отсутствующий токен доступа' } });
-});
 
 app.post('/api/v1/chat/completions', (req, res) => {
     const oai = req.body;
@@ -398,8 +431,14 @@ wss.on('connection', (ws) => {
     ws.on('close', () => { if (upstream) upstream.destroy(); });
 });
 
-server.listen(3000, () => {
-    console.log('Relay ready (ROUTERAPI GPT-4o MINI LOW DETAIL)');
+// Render (и любой другой хостинг) выдаёт свой порт через переменную PORT.
+// Жёстко зашитый 3000 работал на старом сервисе случайно: Render угадывал порт.
+// На новом сервисе это самая частая причина «No open ports detected».
+const PORT = Number(process.env.PORT) || 3000;
+
+server.listen(PORT, '0.0.0.0', () => {
+    console.log('Relay ready (RouterAPI + Gemini, detail high) | v' + SERVER_VERSION + ' | порт ' + PORT);
     console.log('MODEL:', MODEL);
-    console.log('CHUNK=2 | MAX_TOKENS=2048');
+    console.log('CHUNK=' + CHUNK_SIZE + ' (одно фото на запрос) | MAX_TOKENS=' + MAX_TOKENS);
+    console.log('auth: ' + (RELAY_TOKEN ? 'on' : 'off') + ' | telegram: ' + (TG_TOKEN ? 'on' : 'off') + ' | routerapi: ' + (ROUTERAPI_KEY ? 'on' : 'off'));
 });
