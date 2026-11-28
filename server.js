@@ -240,7 +240,7 @@ app.get('/tg/file', async (req, res) => {
     } catch (e) { res.status(500).send(String(e.message)); }
 });
 
-app.get('/', (req, res) => res.send('Relay OK (RouterAPI GPT-4o Mini LowDetail) | partial-guard v2 | v' + SERVER_VERSION + ' | auth: ' + (RELAY_TOKEN ? 'on' : 'off')));
+app.get('/', (req, res) => res.send('Relay OK (RouterAPI + ' + MODEL + ', detail high, 1 фото на запрос) | partial-guard v2 | v' + SERVER_VERSION + ' | auth: ' + (RELAY_TOKEN ? 'on' : 'off')));
 app.get('/api/v1/models', (req, res) => res.json({ data: [{ id: 'routerapi-vision' }] }));
 
 function extractImages(oai) {
